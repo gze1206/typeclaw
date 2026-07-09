@@ -3,10 +3,20 @@ export {
   createMcpConnection,
   createTransport,
   resolveServerEnv,
+  toMcpSdkClient,
   type McpConnection,
   type McpSdkClient,
+  type McpToolAnnotations,
   type McpToolInfo,
 } from './client'
+export {
+  isSafeAuthProbeTool,
+  probeMcpAuth,
+  selectAuthProbeTool,
+  NO_PROBE_TOOL_REASON,
+  type McpAuthProbeResult,
+  type McpAuthProbeTarget,
+} from './probe'
 export {
   createMcpManager,
   namespaceToolName,

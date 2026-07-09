@@ -8,8 +8,17 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { defineCommand } from 'citty'
 
 import { loadConfigSync } from '@/config'
+import type { McpServer } from '@/config/config'
 import { findAgentDir, isInitialized } from '@/init'
-import { createFileMcpOAuthStore, TypeClawMcpOAuthProvider, listMcpCredentials } from '@/mcp'
+import {
+  createFileMcpOAuthStore,
+  createMcpConnection,
+  probeMcpAuth,
+  toMcpSdkClient,
+  TypeClawMcpOAuthProvider,
+  listMcpCredentials,
+  type McpAuthProbeResult,
+} from '@/mcp'
 import { SecretsBackend } from '@/secrets'
 
 import { c, done, errorLine } from './ui'
@@ -110,17 +119,24 @@ export async function runMcpAuthFlow(cwd: string, serverName: string): Promise<M
   })
   const callback = createCallbackServer(DEFAULT_CALLBACK_PORT)
   try {
+    // Stored tokens are a precondition, not proof: without them the server cannot
+    // possibly be authenticated as us, so skip straight to the login. With them,
+    // a live probe still has to confirm they are neither expired nor revoked.
+    const hasTokens = (await provider.tokens()) !== undefined
+
+    // This transport is reused for finishAuth below so it keeps the resource
+    // metadata URL that the 401 handshake discovers here.
     const transport = new StreamableHTTPClientTransport(new URL(server.url), { authProvider: provider })
-    const client = new Client({ name: 'typeclaw', version: '0.17.0' }, { capabilities: {} })
-    try {
-      await client.connect(transport)
-      await client.close()
-      done({ title: c.green(`MCP server "${serverName}" is already authenticated.`), hints: [] })
+    const precheck = await connectAndProbe(server, transport)
+    if (precheck.status === 'unverifiable') return { ok: false, reason: unverifiableReason(serverName, precheck) }
+    if (precheck.status === 'authenticated') {
+      const title = hasTokens
+        ? `MCP server "${serverName}" is already authenticated (verified by calling "${precheck.tool}").`
+        : `MCP server "${serverName}" answered "${precheck.tool}" with no credentials; it does not require OAuth.`
+      done({ title: c.green(title), hints: [] })
       return { ok: true }
-    } catch (cause) {
-      await client.close().catch(() => undefined)
-      if (!(cause instanceof UnauthorizedError)) throw cause
     }
+
     if (authorizationUrl === undefined)
       return { ok: false, reason: 'OAuth server did not provide an authorization URL.' }
     renderAuthorizationUrl(serverName, authorizationUrl)
@@ -131,9 +147,19 @@ export async function runMcpAuthFlow(cwd: string, serverName: string): Promise<M
       return { ok: false, reason: 'OAuth callback state did not match the authorization request.' }
     }
     await transport.finishAuth(codeResult.code)
-    await verifyMcpAuth(server.url, provider)
+
+    const verified = await connectAndProbe(
+      server,
+      new StreamableHTTPClientTransport(new URL(server.url), { authProvider: provider }),
+    )
+    if (verified.status === 'unverifiable') return { ok: false, reason: unverifiableReason(serverName, verified) }
+    if (verified.status === 'unauthenticated')
+      return {
+        ok: false,
+        reason: `Tokens were stored, but ${server.name} still rejects tool calls: ${verified.reason}`,
+      }
     done({
-      title: c.green(`Authenticated MCP server "${serverName}".`),
+      title: c.green(`Authenticated MCP server "${serverName}" (verified by calling "${verified.tool}").`),
       hints: [{ label: 'Apply the secrets.json change:', command: 'typeclaw reload' }],
     })
     return { ok: true }
@@ -141,6 +167,47 @@ export async function runMcpAuthFlow(cwd: string, serverName: string): Promise<M
     return { ok: false, reason: cause instanceof Error ? cause.message : String(cause) }
   } finally {
     callback.stop()
+  }
+}
+
+// Never a success: an unproven login is exactly the state this command exists to
+// avoid leaving the user in.
+function unverifiableReason(
+  serverName: string,
+  result: Extract<McpAuthProbeResult, { status: 'unverifiable' }>,
+): string {
+  return `Cannot verify authentication for MCP server "${serverName}": ${result.reason}`
+}
+
+/**
+ * Connect, then prove the connection is authenticated by calling a real tool.
+ *
+ * `initialize` and `tools/list` both answer unauthenticated on many servers, so
+ * neither can stand in for proof. A 401 on either one is still a useful signal
+ * in the other direction — and it is what makes the transport fetch the
+ * authorization URL through the provider's redirect hook.
+ */
+async function connectAndProbe(
+  server: McpServer,
+  transport: StreamableHTTPClientTransport,
+): Promise<McpAuthProbeResult> {
+  const client = new Client({ name: 'typeclaw', version: '0.17.0' }, { capabilities: {} })
+  try {
+    await client.connect(transport)
+  } catch (cause) {
+    await client.close().catch(() => undefined)
+    if (!(cause instanceof UnauthorizedError)) throw cause
+    return { status: 'unauthenticated', reason: `the server rejected the connection: ${cause.message}` }
+  }
+  try {
+    const connection = createMcpConnection(
+      server.name,
+      toMcpSdkClient(client),
+      server.timeoutMs === undefined ? {} : { timeoutMs: server.timeoutMs },
+    )
+    return await probeMcpAuth(connection, server.authProbeTool === undefined ? {} : { probeTool: server.authProbeTool })
+  } finally {
+    await client.close().catch(() => undefined)
   }
 }
 
@@ -218,16 +285,5 @@ function parseCodeInput(input: string | URL): { code: string; state?: string } |
     return parseCodeInput(new URL(trimmed))
   } catch {
     return { code: trimmed }
-  }
-}
-
-async function verifyMcpAuth(url: string, authProvider: TypeClawMcpOAuthProvider): Promise<void> {
-  const client = new Client({ name: 'typeclaw', version: '0.17.0' }, { capabilities: {} })
-  try {
-    const transport = new StreamableHTTPClientTransport(new URL(url), { authProvider })
-    await client.connect(transport)
-    await client.listTools()
-  } finally {
-    await client.close().catch(() => undefined)
   }
 }

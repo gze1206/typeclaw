@@ -726,6 +726,27 @@ describe('configSchema mcpServers field', () => {
     ])
   })
 
+  test('carries authProbeTool through, and leaves it undefined when omitted', () => {
+    const parsed = configSchema.parse({
+      models: { default: VALID_MODEL },
+      mcpServers: [
+        { name: 'calendar', url: 'https://mcp.example.com/mcp', authProbeTool: 'list_events' },
+        { name: 'docs', url: 'https://docs.example.com/mcp' },
+      ],
+    })
+
+    expect(parsed.mcpServers[0]?.authProbeTool).toBe('list_events')
+    expect(parsed.mcpServers[1]?.authProbeTool).toBeUndefined()
+  })
+
+  test('rejects an empty authProbeTool rather than treating it as unset', () => {
+    const result = configSchema.safeParse({
+      models: { default: VALID_MODEL },
+      mcpServers: [{ name: 'calendar', url: 'https://mcp.example.com/mcp', authProbeTool: '  ' }],
+    })
+    expect(result.success).toBe(false)
+  })
+
   test('rejects duplicate server names with an indexed path at the offending entry', () => {
     const result = configSchema.safeParse({
       models: { default: VALID_MODEL },

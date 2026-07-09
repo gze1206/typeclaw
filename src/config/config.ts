@@ -116,6 +116,11 @@ export const mcpServerSchema = z
     env: z
       .record(z.string().regex(ENV_NAME_PATTERN, 'env var name must be a valid identifier'), secretFieldSchema)
       .default({}),
+    // `typeclaw mcp auth` proves a login worked by calling one real tool. It can
+    // only auto-pick a tool the server annotates as read-only and non-destructive
+    // with no required arguments; servers that annotate nothing need this field
+    // to name a safe tool (e.g. 'list_events') or auth stays unverifiable.
+    authProbeTool: z.string().trim().min(1).optional(),
   })
   .refine((server) => (server.command !== undefined) !== (server.url !== undefined), {
     message: 'MCP server must be either stdio (command) or http (url), not both or neither',

@@ -9,10 +9,18 @@ import { CallToolResultSchema, type CallToolResult, type ListToolsRequest } from
 import type { McpServer } from '@/config/config'
 import { resolveSecret } from '@/secrets/resolve'
 
+// Behaviour hints a server may attach to a tool. Both are advisory and absent on
+// plenty of servers, so treat "missing" as "unknown", never as a safe default.
+export type McpToolAnnotations = {
+  readOnlyHint?: boolean
+  destructiveHint?: boolean
+}
+
 export type McpToolInfo = {
   name: string
   description: string
   inputSchema: unknown
+  annotations?: McpToolAnnotations
 }
 
 // The SDK defaults each request to 60s; typeclaw boot should fail fast enough
@@ -33,7 +41,7 @@ export type McpSdkClient = {
     params?: ListToolsRequest['params'],
     options?: RequestOptions,
   ): Promise<{
-    tools: { name: string; description?: string; inputSchema: unknown }[]
+    tools: { name: string; description?: string; inputSchema: unknown; annotations?: McpToolAnnotations }[]
     nextCursor?: string
   }>
   callTool(
@@ -44,7 +52,26 @@ export type McpSdkClient = {
   close(): Promise<void>
 }
 
-type McpConnectClient = McpSdkClient & {
+// The raw SDK `Client` before `toMcpSdkClient` narrows it: its `callTool` still
+// carries the pre-`content` compatibility shape in its return union, so it is
+// not assignable to `McpSdkClient` until the result is re-parsed.
+export type McpRawClient = {
+  listTools(
+    params?: ListToolsRequest['params'],
+    options?: RequestOptions,
+  ): Promise<{
+    tools: { name: string; description?: string; inputSchema: unknown; annotations?: McpToolAnnotations }[]
+    nextCursor?: string
+  }>
+  callTool(
+    params: { name: string; arguments?: Record<string, unknown> },
+    resultSchema?: typeof CallToolResultSchema,
+    options?: RequestOptions,
+  ): Promise<unknown>
+  close(): Promise<void>
+}
+
+type McpConnectClient = McpRawClient & {
   connect(transport: Transport, options?: RequestOptions): Promise<void>
 }
 
@@ -77,18 +104,21 @@ export async function connectMcpServer(
     throw cause
   }
 
-  return createMcpConnection(
-    server.name,
-    {
-      listTools: (params, options) => client.listTools(params, options),
-      async callTool(params, _resultSchema, options) {
-        const result = await client.callTool(params, CallToolResultSchema, options)
-        return CallToolResultSchema.parse(result)
-      },
-      close: () => client.close(),
+  return createMcpConnection(server.name, toMcpSdkClient(client), { timeoutMs: requestTimeout })
+}
+
+// Narrows a raw SDK `Client` to the slice `createMcpConnection` needs, and
+// re-parses call results so a server that answers off-schema fails here rather
+// than somewhere downstream holding a half-typed result.
+export function toMcpSdkClient(client: McpRawClient): McpSdkClient {
+  return {
+    listTools: (params, options) => client.listTools(params, options),
+    async callTool(params, _resultSchema, options) {
+      const result = await client.callTool(params, CallToolResultSchema, options)
+      return CallToolResultSchema.parse(result)
     },
-    { timeoutMs: requestTimeout },
-  )
+    close: () => client.close(),
+  }
 }
 
 export function createMcpConnection(
@@ -112,6 +142,7 @@ export function createMcpConnection(
           name: tool.name,
           description: tool.description ?? '',
           inputSchema: tool.inputSchema,
+          ...(tool.annotations === undefined ? {} : { annotations: tool.annotations }),
         })),
       )
       cursor = result.nextCursor
