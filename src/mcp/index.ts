@@ -12,6 +12,7 @@ export {
 export {
   isSafeAuthProbeTool,
   probeMcpAuth,
+  safeAuthProbeAlternatives,
   selectAuthProbeTool,
   NO_PROBE_TOOL_REASON,
   type McpAuthProbeResult,

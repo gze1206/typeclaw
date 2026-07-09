@@ -119,7 +119,7 @@ export const mcpServerSchema = z
     // `typeclaw mcp auth` proves a login worked by calling one real tool. It can
     // only auto-pick a tool the server annotates as read-only and non-destructive
     // with no required arguments; servers that annotate nothing need this field
-    // to name a safe tool (e.g. 'list_events') or auth stays unverifiable.
+    // to name a safe tool or auth stays unverifiable.
     authProbeTool: z.string().trim().min(1).optional(),
   })
   .refine((server) => (server.command !== undefined) !== (server.url !== undefined), {

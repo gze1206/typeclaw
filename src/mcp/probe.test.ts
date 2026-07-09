@@ -4,11 +4,17 @@ import { UnauthorizedError } from '@modelcontextprotocol/sdk/client/auth.js'
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js'
 
 import type { McpToolInfo } from './client'
-import { isSafeAuthProbeTool, probeMcpAuth, selectAuthProbeTool, type McpAuthProbeTarget } from './probe'
+import {
+  isSafeAuthProbeTool,
+  probeMcpAuth,
+  safeAuthProbeAlternatives,
+  selectAuthProbeTool,
+  type McpAuthProbeTarget,
+} from './probe'
 
 const readOnlyTool: McpToolInfo = {
-  name: 'list_events',
-  description: 'list calendar events',
+  name: 'list_items',
+  description: 'list items',
   inputSchema: { type: 'object', properties: {} },
   annotations: { readOnlyHint: true },
 }
@@ -19,7 +25,7 @@ const unannotatedTool: McpToolInfo = {
   inputSchema: { type: 'object', properties: {} },
 }
 
-const ok: CallToolResult = { content: [{ type: 'text', text: 'two events' }] }
+const ok: CallToolResult = { content: [{ type: 'text', text: 'two items' }] }
 
 function target(overrides: Partial<McpAuthProbeTarget> & { tools?: McpToolInfo[] } = {}): McpAuthProbeTarget & {
   calls: string[]
@@ -41,9 +47,9 @@ describe('probeMcpAuth', () => {
   test('a successful protected tool call is what proves authentication', async () => {
     const server = target()
     const result = await probeMcpAuth(server)
-    expect(result).toEqual({ status: 'authenticated', tool: 'list_events' })
+    expect(result).toEqual({ status: 'authenticated', tool: 'list_items' })
     // given: tools/list alone must never stand in for proof
-    expect(server.calls).toEqual(['list_events'])
+    expect(server.calls).toEqual(['list_items'])
   })
 
   test('a server whose tools/list is public but whose tools 401 is not authenticated', async () => {
@@ -125,16 +131,31 @@ describe('probeMcpAuth', () => {
 
   test('an in-band non-auth error result proves nothing', async () => {
     const result = await probeMcpAuth(
-      target({ callTool: async () => ({ content: [{ type: 'text', text: 'calendar busy' }], isError: true }) }),
+      target({
+        callTool: async () => ({ content: [{ type: 'text', text: 'the item store is busy' }], isError: true }),
+      }),
+    )
+    expect(result.status).toBe('unverifiable')
+  })
+
+  test('a permission error on the probe tool proves nothing about the credentials', async () => {
+    const result = await probeMcpAuth(
+      target({
+        tools: [readOnlyTool, { ...readOnlyTool, name: 'get_summary' }],
+        callTool: async () => ({
+          content: [{ type: 'text', text: 'The caller does not have permission' }],
+          isError: true,
+        }),
+      }),
     )
     expect(result.status).toBe('unverifiable')
   })
 
   test('the first safe candidate is probed when several qualify', async () => {
-    const other: McpToolInfo = { ...readOnlyTool, name: 'list_calendars' }
+    const other: McpToolInfo = { ...readOnlyTool, name: 'get_summary' }
     const server = target({ tools: [other, readOnlyTool] })
     await probeMcpAuth(server)
-    expect(server.calls).toEqual(['list_calendars'])
+    expect(server.calls).toEqual(['get_summary'])
   })
 })
 
@@ -145,6 +166,19 @@ describe('selectAuthProbeTool', () => {
 
   test('returns undefined when no tool is annotated safe', () => {
     expect(selectAuthProbeTool([unannotatedTool])).toBeUndefined()
+  })
+})
+
+describe('safeAuthProbeAlternatives', () => {
+  test('never offers the tool that just failed as its own replacement', () => {
+    const alternative: McpToolInfo = { ...readOnlyTool, name: 'get_summary' }
+    const names = safeAuthProbeAlternatives([readOnlyTool, alternative], readOnlyTool.name).map((t) => t.name)
+    expect(names).toEqual(['get_summary'])
+  })
+
+  test('offers only tools that are themselves safe to probe', () => {
+    const alternatives = safeAuthProbeAlternatives([readOnlyTool, unannotatedTool], readOnlyTool.name)
+    expect(alternatives).toEqual([])
   })
 })
 

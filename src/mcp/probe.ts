@@ -63,7 +63,7 @@ export async function probeMcpAuth(
   } catch (cause) {
     return isAuthFailure(cause)
       ? { status: 'unauthenticated', reason: `the server rejected "${tool.name}": ${describe(cause)}` }
-      : { status: 'unverifiable', reason: `probe tool "${tool.name}" failed: ${describe(cause)}` }
+      : { status: 'unverifiable', reason: probeFailedReason(tool, tools, `failed: ${describe(cause)}`) }
   }
 
   if (result.isError !== true) return { status: 'authenticated', tool: tool.name }
@@ -74,7 +74,32 @@ export async function probeMcpAuth(
   const text = resultText(result)
   return isAuthFailure(text)
     ? { status: 'unauthenticated', reason: `"${tool.name}" reported an auth error: ${text}` }
-    : { status: 'unverifiable', reason: `probe tool "${tool.name}" returned an error result: ${text}` }
+    : { status: 'unverifiable', reason: probeFailedReason(tool, tools, `returned an error result: ${text}`) }
+}
+
+/**
+ * Safe probe candidates other than `rejected`, best-first.
+ *
+ * A probe that fails for a non-auth reason is a bad probe, not a failed login:
+ * the chosen tool may need permissions the credentials legitimately lack, which
+ * is why the tool that just failed is never offered as its own replacement.
+ */
+export function safeAuthProbeAlternatives(tools: McpToolInfo[], rejected: string): McpToolInfo[] {
+  return tools.filter((candidate) => candidate.name !== rejected && isSafeAuthProbeTool(candidate))
+}
+
+const MAX_SUGGESTED_ALTERNATIVES = 3
+
+function probeFailedReason(tool: McpToolInfo, tools: McpToolInfo[], detail: string): string {
+  const alternatives = safeAuthProbeAlternatives(tools, tool.name)
+  const hint =
+    alternatives.length === 0
+      ? 'Set "authProbeTool" in typeclaw.json to probe a tool these credentials can call.'
+      : `Set "authProbeTool" in typeclaw.json to probe a different tool, e.g. ${alternatives
+          .slice(0, MAX_SUGGESTED_ALTERNATIVES)
+          .map((candidate) => `"${candidate.name}"`)
+          .join(', ')}.`
+  return `probe tool "${tool.name}" ${detail}. ${hint}`
 }
 
 export function selectAuthProbeTool(tools: McpToolInfo[], probeTool?: string): McpToolInfo | undefined {
