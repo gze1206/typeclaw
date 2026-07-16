@@ -30,6 +30,23 @@ export {
   type McpOAuthStore,
   type TypeClawMcpOAuthProviderOptions,
 } from './oauth'
+export {
+  authRecoveryHint,
+  describeCredentialState,
+  isAuthFailure,
+  McpOAuthRequiredError,
+  type McpCredentialState,
+} from './auth-state'
+export {
+  clientRegistrationAcceptsRedirect,
+  parseCodeInput,
+  runMcpAuthFlow,
+  type McpAuthCodeInput,
+  type McpAuthCodeSource,
+  type McpAuthFlowDeps,
+  type McpAuthFlowOutcome,
+} from './auth-flow'
+export { isToolAllowed } from './tool-policy'
 export { renderMcpCatalog, type McpCatalogServer } from './catalog'
 export {
   createMcpDispatcherTools,

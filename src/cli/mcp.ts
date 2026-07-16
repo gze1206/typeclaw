@@ -2,14 +2,22 @@ import { spawn } from 'node:child_process'
 import { join } from 'node:path'
 
 import { isCancel, log, note, text } from '@clack/prompts'
-import { UnauthorizedError } from '@modelcontextprotocol/sdk/client/auth.js'
-import { Client } from '@modelcontextprotocol/sdk/client/index.js'
-import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js'
+import { auth } from '@modelcontextprotocol/sdk/client/auth.js'
 import { defineCommand } from 'citty'
 
 import { loadConfigSync } from '@/config'
 import { findAgentDir, isInitialized } from '@/init'
-import { createFileMcpOAuthStore, TypeClawMcpOAuthProvider, listMcpCredentials } from '@/mcp'
+import {
+  clientRegistrationAcceptsRedirect,
+  createFileMcpOAuthStore,
+  describeCredentialState,
+  listMcpCredentials,
+  parseCodeInput,
+  runMcpAuthFlow,
+  TypeClawMcpOAuthProvider,
+  type McpAuthCodeInput,
+  type McpAuthFlowOutcome,
+} from '@/mcp'
 import { SecretsBackend } from '@/secrets'
 
 import { c, done, errorLine } from './ui'
@@ -23,14 +31,32 @@ const authSub = defineCommand({
   },
   args: {
     server: { type: 'positional', description: 'MCP server name from typeclaw.json', required: true },
+    force: { type: 'boolean', description: 're-authenticate even if credentials already exist' },
+    port: { type: 'string', description: `local OAuth callback port (default ${DEFAULT_CALLBACK_PORT})` },
   },
   async run({ args }) {
     const cwd = ensureAgentDir()
-    const result = await runMcpAuthFlow(cwd, args.server)
+    const port = parsePort(args.port)
+    if (port === null) {
+      console.error(errorLine(`Invalid --port ${JSON.stringify(args.port)}: expected a number between 1 and 65535.`))
+      process.exit(1)
+    }
+    const result = await runMcpAuthCommand(cwd, args.server, { force: args.force === true, port })
     if (!result.ok) {
       console.error(errorLine(result.reason))
       process.exit(1)
     }
+    done({
+      title: c.green(
+        result.status === 'already-authenticated'
+          ? `MCP server "${args.server}" is already authenticated.`
+          : `Authenticated MCP server "${args.server}".`,
+      ),
+      hints:
+        result.status === 'already-authenticated'
+          ? [{ label: 'Force a fresh login:', command: `typeclaw mcp auth ${args.server} --force` }]
+          : [{ label: 'Apply the secrets.json change:', command: 'typeclaw reload' }],
+    })
   },
 })
 
@@ -49,11 +75,11 @@ const listSub = defineCommand({
     }
     const nameWidth = Math.max(4, ...config.mcpServers.map((server) => server.name.length))
     const typeWidth = 5
-    console.log(c.dim(`${'NAME'.padEnd(nameWidth)}  ${'TYPE'.padEnd(typeWidth)}  OAUTH`))
+    console.log(c.dim(`${'NAME'.padEnd(nameWidth)}  ${'TYPE'.padEnd(typeWidth)}  AUTH`))
     for (const server of config.mcpServers) {
       const type = server.url === undefined ? 'stdio' : 'http'
-      const oauth = credentials[server.name] === undefined ? 'not configured' : 'configured'
-      console.log(`${server.name.padEnd(nameWidth)}  ${type.padEnd(typeWidth)}  ${oauth}`)
+      const state = describeCredentialState(server, credentials[server.name])
+      console.log(`${server.name.padEnd(nameWidth)}  ${type.padEnd(typeWidth)}  ${state}`)
     }
   },
 })
@@ -89,18 +115,34 @@ export const mcpCommand = defineCommand({
   },
 })
 
-export type McpAuthFlowResult = { ok: true } | { ok: false; reason: string }
-
-export async function runMcpAuthFlow(cwd: string, serverName: string): Promise<McpAuthFlowResult> {
+// Thin shell: resolve config + I/O collaborators, then hand the decision logic to
+// runMcpAuthFlow (src/mcp/auth-flow.ts), which is where the auth semantics and
+// their tests live.
+async function runMcpAuthCommand(
+  cwd: string,
+  serverName: string,
+  opts: { force: boolean; port: number },
+): Promise<McpAuthFlowOutcome> {
   const config = loadConfigSync(cwd)
   const server = config.mcpServers.find((candidate) => candidate.name === serverName)
   if (server === undefined) return { ok: false, reason: `MCP server "${serverName}" is not configured.` }
-  if (server.url === undefined)
+  const serverUrl = server.url
+  if (serverUrl === undefined)
     return { ok: false, reason: `MCP server "${serverName}" is stdio-only; OAuth is HTTP-only.` }
 
-  const redirectUrl = `http://localhost:${DEFAULT_CALLBACK_PORT}/callback`
+  const secretsPath = join(cwd, 'secrets.json')
+  const store = createFileMcpOAuthStore(secretsPath)
+  const redirectUrl = `http://localhost:${opts.port}/callback`
+
+  // A registration minted on another port would be rejected at the AS on exact
+  // redirect_uri match, so drop it and let dynamic registration re-mint.
+  const existing = await store.get(serverName)
+  if (!clientRegistrationAcceptsRedirect(existing?.client, redirectUrl)) {
+    await store.invalidate(serverName, 'client')
+  }
+
   let authorizationUrl: URL | undefined
-  const provider = new TypeClawMcpOAuthProvider(serverName, createFileMcpOAuthStore(join(cwd, 'secrets.json')), {
+  const provider = new TypeClawMcpOAuthProvider(serverName, store, {
     mode: 'host',
     redirectUrl,
     clientName: 'typeclaw',
@@ -108,40 +150,51 @@ export async function runMcpAuthFlow(cwd: string, serverName: string): Promise<M
       authorizationUrl = url
     },
   })
-  const callback = createCallbackServer(DEFAULT_CALLBACK_PORT)
+
+  let callback: CallbackServer
   try {
-    const transport = new StreamableHTTPClientTransport(new URL(server.url), { authProvider: provider })
-    const client = new Client({ name: 'typeclaw', version: '0.17.0' }, { capabilities: {} })
-    try {
-      await client.connect(transport)
-      await client.close()
-      done({ title: c.green(`MCP server "${serverName}" is already authenticated.`), hints: [] })
-      return { ok: true }
-    } catch (cause) {
-      await client.close().catch(() => undefined)
-      if (!(cause instanceof UnauthorizedError)) throw cause
-    }
-    if (authorizationUrl === undefined)
-      return { ok: false, reason: 'OAuth server did not provide an authorization URL.' }
-    renderAuthorizationUrl(serverName, authorizationUrl)
-    openBrowserBestEffort(authorizationUrl)
-    const expectedState = await provider.state()
-    const codeResult = await Promise.race([callback.code, promptForCodeOrUrl()])
-    if (expectedState !== undefined && codeResult.state !== undefined && codeResult.state !== expectedState) {
-      return { ok: false, reason: 'OAuth callback state did not match the authorization request.' }
-    }
-    await transport.finishAuth(codeResult.code)
-    await verifyMcpAuth(server.url, provider)
-    done({
-      title: c.green(`Authenticated MCP server "${serverName}".`),
-      hints: [{ label: 'Apply the secrets.json change:', command: 'typeclaw reload' }],
-    })
-    return { ok: true }
+    callback = createCallbackServer(opts.port)
   } catch (cause) {
+    if (isAddressInUse(cause)) {
+      return {
+        ok: false,
+        reason: `OAuth callback port ${opts.port} is already in use. Free it, or pick another with: typeclaw mcp auth ${serverName} --port <port>`,
+      }
+    }
     return { ok: false, reason: cause instanceof Error ? cause.message : String(cause) }
+  }
+
+  try {
+    return await runMcpAuthFlow({
+      serverName,
+      force: opts.force,
+      expectedState: () => provider.state(),
+      authorize: (authOpts) =>
+        auth(provider, {
+          serverUrl,
+          ...(authOpts?.authorizationCode === undefined ? {} : { authorizationCode: authOpts.authorizationCode }),
+        }),
+      authorizationUrl: () => authorizationUrl,
+      onAuthorizationUrl: (url) => {
+        renderAuthorizationUrl(serverName, url)
+        openBrowserBestEffort(url)
+      },
+      waitForCode: () => waitForCode(callback),
+      invalidateTokens: () => store.invalidate(serverName, 'tokens'),
+      // A fresh store instance so this reads DISK, not the provider's in-memory
+      // view — that is the whole point of the persistence check.
+      readPersistedTokens: async () => (await createFileMcpOAuthStore(secretsPath).get(serverName))?.tokens,
+    })
   } finally {
     callback.stop()
   }
+}
+
+function parsePort(raw: unknown): number | null {
+  if (raw === undefined || raw === '') return DEFAULT_CALLBACK_PORT
+  const port = Number(raw)
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return null
+  return port
 }
 
 function ensureAgentDir(): string {
@@ -153,9 +206,22 @@ function ensureAgentDir(): string {
   return cwd
 }
 
-function createCallbackServer(port: number): { code: Promise<{ code: string; state?: string }>; stop(): void } {
-  let resolveCode!: (value: { code: string; state?: string }) => void
-  const code = new Promise<{ code: string; state?: string }>((resolve) => {
+type CallbackServer = { code: Promise<McpAuthCodeInput>; stop(): void }
+
+// Race the browser callback against a manual paste. Whichever wins, the loser is
+// cancelled: an abandoned clack prompt keeps stdin captured and the process alive.
+async function waitForCode(callback: CallbackServer): Promise<McpAuthCodeInput> {
+  const abort = new AbortController()
+  try {
+    return await Promise.race([callback.code, promptForCodeOrUrl(abort.signal)])
+  } finally {
+    abort.abort()
+  }
+}
+
+function createCallbackServer(port: number): CallbackServer {
+  let resolveCode!: (value: McpAuthCodeInput) => void
+  const code = new Promise<McpAuthCodeInput>((resolve) => {
     resolveCode = resolve
   })
   const server = Bun.serve({
@@ -164,13 +230,21 @@ function createCallbackServer(port: number): { code: Promise<{ code: string; sta
     fetch(req) {
       const url = new URL(req.url)
       if (url.pathname !== '/callback') return new Response('Not found', { status: 404 })
-      const parsed = parseCodeInput(url)
+      const parsed = parseCodeInput(url, 'callback')
       if (parsed === null) return new Response('Missing OAuth code', { status: 400 })
       resolveCode(parsed)
       return new Response('TypeClaw MCP OAuth complete. You can close this tab.')
     },
   })
   return { code, stop: () => server.stop(true) }
+}
+
+function isAddressInUse(cause: unknown): boolean {
+  if (typeof cause !== 'object' || cause === null) return false
+  const code = (cause as { code?: unknown }).code
+  if (code === 'EADDRINUSE') return true
+  const message = cause instanceof Error ? cause.message : ''
+  return message.includes('EADDRINUSE') || message.includes('address already in use')
 }
 
 function renderAuthorizationUrl(serverName: string, url: URL): void {
@@ -194,40 +268,14 @@ function openBrowserBestEffort(url: URL): void {
   child.unref()
 }
 
-async function promptForCodeOrUrl(): Promise<{ code: string; state?: string }> {
+async function promptForCodeOrUrl(signal: AbortSignal): Promise<McpAuthCodeInput> {
   const value = await text({
     message: 'After signing in, paste the code or full redirect URL:',
     placeholder: 'code, or http://localhost:1456/callback?code=...&state=...',
+    signal,
   })
   if (isCancel(value)) throw new Error('OAuth login cancelled by user')
-  const parsed = parseCodeInput(value)
+  const parsed = parseCodeInput(value, 'manual')
   if (parsed === null) throw new Error('OAuth callback did not include a code')
   return parsed
-}
-
-function parseCodeInput(input: string | URL): { code: string; state?: string } | null {
-  if (input instanceof URL) {
-    const code = input.searchParams.get('code')
-    if (code === null || code.trim() === '') return null
-    const state = input.searchParams.get('state') ?? undefined
-    return { code, ...(state === undefined ? {} : { state }) }
-  }
-  const trimmed = input.trim()
-  if (trimmed === '') return null
-  try {
-    return parseCodeInput(new URL(trimmed))
-  } catch {
-    return { code: trimmed }
-  }
-}
-
-async function verifyMcpAuth(url: string, authProvider: TypeClawMcpOAuthProvider): Promise<void> {
-  const client = new Client({ name: 'typeclaw', version: '0.17.0' }, { capabilities: {} })
-  try {
-    const transport = new StreamableHTTPClientTransport(new URL(url), { authProvider })
-    await client.connect(transport)
-    await client.listTools()
-  } finally {
-    await client.close().catch(() => undefined)
-  }
 }
