@@ -12,12 +12,34 @@ export type McpConnectResult =
 
 export type McpRefreshResult = { ok: true; name: string; toolCount: number } | { ok: false; name: string; error: Error }
 
+// Only ever 'needs-auth': the field's ABSENCE means "no auth failure seen", so a
+// separate 'ok'/'unknown' state would be a synonym for undefined that every
+// reader would have to handle twice.
+export type McpServerAuthState = 'needs-auth'
+
+export type McpServerInfo = {
+  name: string
+  description?: string
+  connected: boolean
+  toolCount?: number
+  authState?: McpServerAuthState
+}
+
 export type McpManager = {
   connectAll(opts?: { signal?: AbortSignal }): Promise<McpConnectResult[]>
   ensureConnected(name: string): Promise<McpConnection | undefined>
   whenInitialConnectSettled(opts?: { timeoutMs?: number }): Promise<void>
   getConnection(name: string): McpConnection | undefined
-  listServers(): { name: string; description?: string; connected: boolean; toolCount?: number }[]
+  // The server's declared config, for callers that need policy (tool gating)
+  // rather than connection state. Returns undefined for names that are not
+  // configured or not enabled — the same visibility rule listServers uses.
+  getServer(name: string): McpServer | undefined
+  listServers(): McpServerInfo[]
+  // Record that a call against this server failed for a reason re-authentication
+  // would fix. A connected server can still be unauthenticated — tools/list is
+  // public on many servers while tools/call is not — so connection state alone
+  // cannot answer "can this server actually be used".
+  markAuthFailure(name: string): void
   refresh(): Promise<McpRefreshResult[]>
   closeAll(): Promise<void>
 }
@@ -37,6 +59,7 @@ export function createMcpManager(
   const connect = opts.connect ?? connectMcpServer
   const connections = new Map<string, McpConnection>()
   const toolCounts = new Map<string, number>()
+  const authFailures = new Set<string>()
   // In-flight connect promises keyed by server name. Shared by connectAll (boot
   // warm-up) and ensureConnected (lazy, on a tool call) so a tool call racing
   // the warm-up — or two concurrent tool calls — coalesce onto one connect
@@ -150,7 +173,10 @@ export function createMcpManager(
     getConnection(name: string): McpConnection | undefined {
       return connections.get(name)
     },
-    listServers(): { name: string; description?: string; connected: boolean; toolCount?: number }[] {
+    getServer(name: string): McpServer | undefined {
+      return activeServers.find((server) => server.name === name)
+    },
+    listServers(): McpServerInfo[] {
       return activeServers.map((server) => {
         const toolCount = toolCounts.get(server.name)
         return {
@@ -158,8 +184,15 @@ export function createMcpManager(
           connected: connections.has(server.name),
           ...(server.description === undefined ? {} : { description: server.description }),
           ...(toolCount === undefined ? {} : { toolCount }),
+          ...(authFailures.has(server.name) ? { authState: 'needs-auth' as const } : {}),
         }
       })
+    },
+    markAuthFailure(name: string): void {
+      // Ignore names that aren't configured/enabled, so a stale or mistyped name
+      // can't invent a server that listServers would never report.
+      if (!activeServers.some((server) => server.name === name)) return
+      authFailures.add(name)
     },
     async refresh(): Promise<McpRefreshResult[]> {
       // One unhealthy connection must not discard healthy servers' tool-count
@@ -184,6 +217,7 @@ export function createMcpManager(
       await Promise.allSettled([...connections.values()].map((connection) => connection.close()))
       connections.clear()
       toolCounts.clear()
+      authFailures.clear()
       inflight.clear()
       initialConnect = null
     },

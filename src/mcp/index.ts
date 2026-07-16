@@ -16,6 +16,8 @@ export {
   type ConnectMcpServerFn,
   type McpConnectResult,
   type McpManager,
+  type McpServerAuthState,
+  type McpServerInfo,
 } from './manager'
 export {
   createFileMcpOAuthStore,

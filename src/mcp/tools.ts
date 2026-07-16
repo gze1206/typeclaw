@@ -5,9 +5,11 @@ import { enforceAndPinToolFiles } from '@/agent/tool-file-safety'
 import { defineTool } from '@/plugin/define'
 import type { ContentPart, Tool, ToolResult } from '@/plugin/types'
 
+import { authRecoveryHint, isAuthFailure } from './auth-state'
 import type { McpConnection, McpToolInfo } from './client'
 import type { McpManager } from './manager'
 import { namespaceToolName, parseNamespacedTool } from './manager'
+import { isToolAllowed } from './tool-policy'
 
 export const MCP_DISPATCHER_TOOL_NAMES = ['mcp_list_tools', 'mcp_describe', 'mcp_call'] as const
 
@@ -31,7 +33,7 @@ function createListToolsTool(manager: McpManager): Tool<McpListToolsArgs> {
       const connection = await manager.ensureConnected(args.server)
       if (connection === undefined) return textResult(unknownServerMessage(manager, args.server))
 
-      const tools = await safeListTools(connection)
+      const tools = await visibleTools(manager, args.server, connection)
       if (tools.length === 0) return textResult(`MCP server ${JSON.stringify(args.server)} exposes no tools.`)
 
       const lines = tools.map((tool) => {
@@ -55,13 +57,10 @@ function createDescribeTool(manager: McpManager): Tool<McpDescribeArgs> {
       const connection = await manager.ensureConnected(resolved.server)
       if (connection === undefined) return textResult(unknownServerMessage(manager, resolved.server))
 
-      const tools = await safeListTools(connection)
+      const tools = await visibleTools(manager, resolved.server, connection)
       const tool = tools.find((item) => item.name === resolved.tool)
       if (tool === undefined) {
-        const available = tools.map((item) => namespaceToolName(resolved.server, item.name)).join(', ')
-        return textResult(
-          `Unknown MCP tool ${JSON.stringify(resolved.tool)} on server ${JSON.stringify(resolved.server)}. Available tools: ${available || 'none'}.`,
-        )
+        return textResult(unknownToolMessageFor(resolved.server, resolved.tool, tools))
       }
 
       const description = tool.description.trim() === '' ? 'no description' : tool.description.trim()
@@ -93,6 +92,14 @@ function createCallTool(manager: McpManager): Tool<McpCallArgs> {
       const connection = await manager.ensureConnected(resolved.server)
       if (connection === undefined) return textResult(unknownServerMessage(manager, resolved.server))
 
+      // Gate BEFORE the request goes out: a denied call that reaches the server
+      // has already had its side effect by the time we refuse it. The refusal
+      // mirrors the unknown-tool wording so list/describe/call describe one
+      // world — a tool the policy hides simply does not exist.
+      if (!allowsTool(manager, resolved.server, resolved.tool)) {
+        return textResult(await unknownToolMessage(manager, resolved.server, resolved.tool, connection))
+      }
+
       const toolArgs = args.args ?? {}
       const pinned = await enforceAndPinToolFiles({
         tool: 'mcp_call',
@@ -102,7 +109,7 @@ function createCallTool(manager: McpManager): Tool<McpCallArgs> {
         signal: ctx.signal,
       })
       try {
-        const result = await safeCallTool(connection, resolved.tool, toolArgs)
+        const result = await safeCallTool(manager, resolved.server, connection, resolved.tool, toolArgs)
         return pinned.restoreResult(mapCallToolResult(resolved.server, resolved.tool, result))
       } finally {
         await pinned.cleanup()
@@ -128,15 +135,47 @@ function unknownServerMessage(manager: McpManager, server: string): string {
   return `Unknown MCP server ${JSON.stringify(server)}. Available servers: ${available || 'none'}.`
 }
 
-async function safeListTools(connection: McpConnection): Promise<McpToolInfo[]> {
+// The tool list as the model is allowed to see it. Every dispatcher reads the
+// catalog through here, so a policy-hidden tool is invisible to list, describe
+// and call alike rather than only to whichever one remembered to filter.
+async function visibleTools(manager: McpManager, server: string, connection: McpConnection): Promise<McpToolInfo[]> {
+  const tools = await safeListTools(manager, server, connection)
+  const declared = manager.getServer(server)
+  if (declared === undefined) return tools
+  return tools.filter((tool) => isToolAllowed(declared, tool.name))
+}
+
+function allowsTool(manager: McpManager, server: string, tool: string): boolean {
+  const declared = manager.getServer(server)
+  if (declared === undefined) return true
+  return isToolAllowed(declared, tool)
+}
+
+function unknownToolMessageFor(server: string, tool: string, tools: McpToolInfo[]): string {
+  const available = tools.map((item) => namespaceToolName(server, item.name)).join(', ')
+  return `Unknown MCP tool ${JSON.stringify(tool)} on server ${JSON.stringify(server)}. Available tools: ${available || 'none'}.`
+}
+
+async function unknownToolMessage(
+  manager: McpManager,
+  server: string,
+  tool: string,
+  connection: McpConnection,
+): Promise<string> {
+  return unknownToolMessageFor(server, tool, await visibleTools(manager, server, connection))
+}
+
+async function safeListTools(manager: McpManager, server: string, connection: McpConnection): Promise<McpToolInfo[]> {
   try {
     return await connection.listTools()
   } catch (cause) {
-    throw new Error(`MCP list tools failed: ${sanitizeMcpError(errorMessage(cause))}`)
+    throw toDispatcherError(manager, server, cause, 'MCP list tools failed')
   }
 }
 
 async function safeCallTool(
+  manager: McpManager,
+  server: string,
   connection: McpConnection,
   tool: string,
   args: Record<string, unknown>,
@@ -144,8 +183,20 @@ async function safeCallTool(
   try {
     return await connection.callTool(tool, args)
   } catch (cause) {
-    throw new Error(`MCP call failed: ${sanitizeMcpError(errorMessage(cause))}`)
+    throw toDispatcherError(manager, server, cause, 'MCP call failed')
   }
+}
+
+// An auth failure is the one MCP error a human can actually clear, so it gets
+// the command instead of a sanitized 401 the model can only relay. Everything
+// else keeps the generic prefix — if the hint appeared on every failure it would
+// stop carrying information.
+function toDispatcherError(manager: McpManager, server: string, cause: unknown, prefix: string): Error {
+  if (isAuthFailure(cause)) {
+    manager.markAuthFailure(server)
+    return new Error(authRecoveryHint(server))
+  }
+  return new Error(`${prefix}: ${sanitizeMcpError(errorMessage(cause))}`)
 }
 
 function mapCallToolResult(server: string, tool: string, result: CallToolResult): ToolResult {

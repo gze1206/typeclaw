@@ -167,6 +167,52 @@ describe('createMcpManager', () => {
     expect(manager.listServers()).toEqual([{ name: 'alpha', connected: true, toolCount: 2 }])
   })
 
+  test('surfaces a marked auth failure through listServers', async () => {
+    const manager = createMcpManager([httpServer('linear'), httpServer('acme')], {
+      env: {},
+      async connect(mcpServer) {
+        return fakeConnection(mcpServer.name, [{ name: 'tool', description: '', inputSchema: {} }], [])
+      },
+    })
+    await manager.connectAll()
+
+    manager.markAuthFailure('linear')
+
+    expect(manager.listServers()).toEqual([
+      { name: 'linear', connected: true, toolCount: 1, authState: 'needs-auth' },
+      { name: 'acme', connected: true, toolCount: 1 },
+    ])
+  })
+
+  test('ignores an auth failure marked against an unconfigured server', async () => {
+    const manager = createMcpManager([httpServer('linear')], {
+      env: {},
+      async connect(mcpServer) {
+        return fakeConnection(mcpServer.name, [{ name: 'tool', description: '', inputSchema: {} }], [])
+      },
+    })
+    await manager.connectAll()
+
+    manager.markAuthFailure('ghost')
+
+    expect(manager.listServers()).toEqual([{ name: 'linear', connected: true, toolCount: 1 }])
+  })
+
+  test('clears auth failures on closeAll so a restarted manager does not inherit them', async () => {
+    const manager = createMcpManager([httpServer('linear')], {
+      env: {},
+      async connect(mcpServer) {
+        return fakeConnection(mcpServer.name, [{ name: 'tool', description: '', inputSchema: {} }], [])
+      },
+    })
+    await manager.connectAll()
+    manager.markAuthFailure('linear')
+
+    await manager.closeAll()
+
+    expect(manager.listServers()).toEqual([{ name: 'linear', connected: false }])
+  })
+
   test('refresh isolates a failing connection so healthy servers still update', async () => {
     const manager = createMcpManager([server('healthy'), server('broken')], {
       env: {},

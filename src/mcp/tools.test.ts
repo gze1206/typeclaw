@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { pathToFileURL } from 'node:url'
 
+import { UnauthorizedError } from '@modelcontextprotocol/sdk/client/auth.js'
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js'
 
 import { buildMcpDispatcherToolDefinitions } from '@/agent'
@@ -93,6 +94,133 @@ describe('createMcpDispatcherTools', () => {
       content: [{ type: 'text', text: 'file contents' }],
       details: { server: 'files', tool: 'read', isError: false },
     })
+  })
+
+  test('mcp_call turns an auth failure into the command that fixes it', async () => {
+    // A server whose tools/list is public but whose tools/call demands OAuth
+    // fails only here — connect and the catalog both looked healthy. Without this
+    // the model just sees a sanitized 401 and cannot know a human can fix it.
+    const manager = fakeManager({ linear: failingCallConnection('linear', new UnauthorizedError()) })
+    const [, , callTool] = createMcpDispatcherTools(manager)
+
+    const call = callTool.execute({ server: 'linear', tool: 'create_issue' } satisfies McpCallArgs, toolContext())
+
+    await expect(call).rejects.toThrow('typeclaw mcp auth linear')
+  })
+
+  test('mcp_call records the auth failure on the manager', async () => {
+    const authFailures: string[] = []
+    const manager = fakeManager({ linear: failingCallConnection('linear', new UnauthorizedError()) }, authFailures)
+    const [, , callTool] = createMcpDispatcherTools(manager)
+
+    await callTool
+      .execute({ server: 'linear', tool: 'create_issue' } satisfies McpCallArgs, toolContext())
+      .catch(() => undefined)
+
+    expect(authFailures).toEqual(['linear'])
+  })
+
+  test('mcp_call keeps reporting non-auth failures as call failures', async () => {
+    // The recovery hint must stay rare enough to mean something; a transport
+    // error is not something `typeclaw mcp auth` can fix.
+    const authFailures: string[] = []
+    const manager = fakeManager(
+      { linear: failingCallConnection('linear', new Error('connection reset')) },
+      authFailures,
+    )
+    const [, , callTool] = createMcpDispatcherTools(manager)
+
+    const call = callTool.execute({ server: 'linear', tool: 'create_issue' } satisfies McpCallArgs, toolContext())
+
+    await expect(call).rejects.toThrow('MCP call failed')
+    expect(authFailures).toEqual([])
+  })
+
+  test('mcp_list_tools turns an auth failure into the command that fixes it', async () => {
+    const manager = fakeManager({ linear: failingListConnection('linear', new UnauthorizedError()) })
+    const [listTools] = createMcpDispatcherTools(manager)
+
+    const call = listTools.execute({ server: 'linear' } satisfies McpListToolsArgs, toolContext())
+
+    await expect(call).rejects.toThrow('typeclaw mcp auth linear')
+  })
+
+  test('mcp_list_tools hides denied tools so the model never learns they exist', async () => {
+    const manager = fakeManager({ linear: fakeConnection('linear', [tool('search'), tool('delete_project')]) }, [], {
+      linear: { denyTools: ['delete_project'] },
+    })
+    const [listTools] = createMcpDispatcherTools(manager)
+
+    const result = await listTools.execute({ server: 'linear' } satisfies McpListToolsArgs, toolContext())
+
+    expect(textOf(result)).toContain('linear__search')
+    expect(textOf(result)).not.toContain('delete_project')
+  })
+
+  test('mcp_list_tools shows only allowlisted tools', async () => {
+    const manager = fakeManager({ linear: fakeConnection('linear', [tool('search'), tool('delete_project')]) }, [], {
+      linear: { allowTools: ['search'] },
+    })
+    const [listTools] = createMcpDispatcherTools(manager)
+
+    const result = await listTools.execute({ server: 'linear' } satisfies McpListToolsArgs, toolContext())
+
+    expect(textOf(result)).toContain('linear__search')
+    expect(textOf(result)).not.toContain('delete_project')
+  })
+
+  test('mcp_describe answers for a denied tool exactly as it does for an unknown one', async () => {
+    // list, describe and call must agree on one world. Saying "this tool is
+    // blocked" would advertise the tool and invite workarounds; a tool that is
+    // not in the list is simply not there.
+    const manager = fakeManager({ linear: fakeConnection('linear', [tool('search'), tool('delete_project')]) }, [], {
+      linear: { denyTools: ['delete_project'] },
+    })
+    const [, describe] = createMcpDispatcherTools(manager)
+
+    const denied = await describe.execute(
+      { server: 'linear', tool: 'delete_project' } satisfies McpDescribeArgs,
+      toolContext(),
+    )
+    const missing = await describe.execute(
+      { server: 'linear', tool: 'no_such_tool' } satisfies McpDescribeArgs,
+      toolContext(),
+    )
+
+    expect(textOf(denied)).toContain('Unknown MCP tool')
+    expect(textOf(denied)).not.toContain('delete_project"\nDescription')
+    // The denied tool must not be advertised in the "available tools" list either.
+    expect(textOf(missing)).not.toContain('delete_project')
+  })
+
+  test('mcp_call rejects a denied tool without reaching the server', async () => {
+    // Load-bearing: a denied call that reaches the server has already had its
+    // side effect by the time we refuse it.
+    const calls: string[] = []
+    const manager = fakeManager({ linear: recordingConnection('linear', [tool('delete_project')], calls) }, [], {
+      linear: { denyTools: ['delete_project'] },
+    })
+    const [, , callTool] = createMcpDispatcherTools(manager)
+
+    const result = await callTool.execute(
+      { server: 'linear', tool: 'delete_project' } satisfies McpCallArgs,
+      toolContext(),
+    )
+
+    expect(textOf(result)).toContain('Unknown MCP tool')
+    expect(calls).toEqual([])
+  })
+
+  test('mcp_call still dispatches an allowed tool', async () => {
+    const calls: string[] = []
+    const manager = fakeManager({ linear: recordingConnection('linear', [tool('search')], calls) }, [], {
+      linear: { denyTools: ['delete_project'] },
+    })
+    const [, , callTool] = createMcpDispatcherTools(manager)
+
+    await callTool.execute({ server: 'linear', tool: 'search' } satisfies McpCallArgs, toolContext())
+
+    expect(calls).toEqual(['search'])
   })
 
   test('mcp_call blocks nested file URLs before invoking the external server', async () => {
@@ -435,8 +563,46 @@ describe('sanitizeMcpError', () => {
   })
 })
 
-function fakeManager(connections: Record<string, McpConnection>): McpManager {
+function tool(name: string): McpToolInfo {
+  return { name, description: `${name} description`, inputSchema: { type: 'object' } }
+}
+
+function textOf(result: { content: { type: string; text?: string }[] }): string {
+  return result.content
+    .filter((part) => part.type === 'text')
+    .map((part) => part.text ?? '')
+    .join('\n')
+}
+
+function recordingConnection(name: string, tools: McpToolInfo[], calls: string[]): McpConnection {
   return {
+    ...fakeConnection(name, tools),
+    async callTool(toolName) {
+      calls.push(toolName)
+      return { content: [{ type: 'text', text: 'ok' }] }
+    },
+  }
+}
+
+type FakeServerPolicy = { allowTools?: string[]; denyTools?: string[] }
+
+function fakeManager(
+  connections: Record<string, McpConnection>,
+  authFailures: string[] = [],
+  policies: Record<string, FakeServerPolicy> = {},
+): McpManager {
+  return {
+    getServer(name) {
+      if (connections[name] === undefined) return undefined
+      return {
+        name,
+        enabled: true,
+        url: 'https://mcp.example.com/mcp',
+        args: [],
+        env: {},
+        ...policies[name],
+      }
+    },
     async connectAll() {
       return Object.entries(connections).map(([name, connection]) => ({
         ok: true as const,
@@ -455,10 +621,31 @@ function fakeManager(connections: Record<string, McpConnection>): McpManager {
     listServers() {
       return Object.keys(connections).map((name) => ({ name, connected: true, toolCount: 0 }))
     },
+    markAuthFailure(name) {
+      authFailures.push(name)
+    },
     async refresh() {
       return Object.keys(connections).map((name) => ({ ok: true as const, name, toolCount: 0 }))
     },
     async closeAll() {},
+  }
+}
+
+function failingCallConnection(name: string, cause: Error): McpConnection {
+  return {
+    ...fakeConnection(name, []),
+    async callTool() {
+      throw cause
+    },
+  }
+}
+
+function failingListConnection(name: string, cause: Error): McpConnection {
+  return {
+    ...fakeConnection(name, []),
+    async listTools() {
+      throw cause
+    },
   }
 }
 
