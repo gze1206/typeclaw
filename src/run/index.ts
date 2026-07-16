@@ -56,7 +56,12 @@ import {
   type Scheduler,
 } from '@/cron'
 import { CLI_VERSION } from '@/init/cli-version'
-import { createMcpManager, resolveContainerMcpOAuthStore, TypeClawMcpOAuthProvider } from '@/mcp'
+import {
+  createMcpManager,
+  resolveContainerMcpOAuthStore,
+  TypeClawMcpOAuthProvider,
+  usesStaticAuthorization,
+} from '@/mcp'
 import { runStartupMigrations } from '@/migrations'
 import { loadPlugins, type LoadPluginsResult, pluginCronJobs, type PluginRegistry, summarizeLoaded } from '@/plugin'
 import { createPluginLogger } from '@/plugin/context'
@@ -255,8 +260,11 @@ async function startAgentRuntime(
     cwdConfig.mcpServers.length > 0
       ? createMcpManager(cwdConfig.mcpServers, {
           env: process.env,
+          // A server that carries its own Authorization header (bearerToken or
+          // an explicit header) needs no OAuth provider — attaching one would
+          // start a discovery/redirect dance for a credential we already hold.
           authProvider: (server) =>
-            server.url === undefined
+            server.url === undefined || usesStaticAuthorization(server)
               ? undefined
               : new TypeClawMcpOAuthProvider(server.name, mcpOAuthStore, {
                   mode: 'container',

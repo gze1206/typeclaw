@@ -3,6 +3,8 @@ export {
   createMcpConnection,
   createTransport,
   resolveServerEnv,
+  resolveServerHeaders,
+  usesStaticAuthorization,
   type McpConnection,
   type McpSdkClient,
   type McpToolInfo,

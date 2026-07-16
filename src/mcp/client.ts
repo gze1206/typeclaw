@@ -7,7 +7,7 @@ import type { Transport } from '@modelcontextprotocol/sdk/shared/transport.js'
 import { CallToolResultSchema, type CallToolResult, type ListToolsRequest } from '@modelcontextprotocol/sdk/types.js'
 
 import type { McpServer } from '@/config/config'
-import { resolveSecret } from '@/secrets/resolve'
+import { resolveSecret, type Secret } from '@/secrets/resolve'
 
 export type McpToolInfo = {
   name: string
@@ -152,9 +152,13 @@ export function createTransport(
     return new StdioClientTransport({ command: server.command, args: server.args, env: resolveServerEnv(server, env) })
   }
   const url = new URL(requiredUrl(server))
-  return authProvider === undefined
-    ? new StreamableHTTPClientTransport(url)
-    : new StreamableHTTPClientTransport(url, { authProvider })
+  const headers = resolveServerHeaders(server, env)
+  const hasHeaders = Object.keys(headers).length > 0
+  if (authProvider === undefined && !hasHeaders) return new StreamableHTTPClientTransport(url)
+  return new StreamableHTTPClientTransport(url, {
+    ...(authProvider === undefined ? {} : { authProvider }),
+    ...(hasHeaders ? { requestInit: { headers } } : {}),
+  })
 }
 
 async function withConnectDeadline<T>(
@@ -238,6 +242,58 @@ export function resolveServerEnv(server: Pick<McpServer, 'env'>, env: NodeJS.Pro
   }
 
   return childEnv
+}
+
+// Whether the server already authenticates itself via a static Authorization
+// header, making an OAuth provider redundant. Only the Authorization header
+// counts: the SDK overwrites exactly that header when a provider is attached, so
+// pairing the two is contradictory. Other custom headers (tenant routing,
+// tracing) coexist with OAuth and must NOT suppress the provider.
+export function usesStaticAuthorization(server: Pick<McpServer, 'headers' | 'bearerToken'>): boolean {
+  if (server.bearerToken !== undefined) return true
+  return Object.keys(server.headers ?? {}).some((name) => name.toLowerCase() === 'authorization')
+}
+
+// Static HTTP auth for servers that authenticate with an API key rather than
+// OAuth — the majority of the HTTP MCP ecosystem today.
+//
+// Two deliberate departures from resolveServerEnv:
+//
+//  1. NO env-wins override on the map key. There, keys ARE env var names, so
+//     `env[key]` is the same namespace. A header key is an HTTP field name; it
+//     shares nothing with the process env, and honouring `env['X-API-Key']`
+//     would let an unrelated ambient variable silently become a credential.
+//     Reading the env stays explicit, via a `{ env: '...' }` Secret.
+//  2. An unresolvable header THROWS instead of being dropped. An absent env
+//     var is a missing credential, and headers are the credential here — a
+//     silent omission surfaces later as an opaque 401 with nothing pointing
+//     back at the typo.
+export function resolveServerHeaders(
+  server: Pick<McpServer, 'name' | 'headers' | 'bearerToken'>,
+  env: NodeJS.ProcessEnv,
+): Record<string, string> {
+  const headers: Record<string, string> = {}
+
+  for (const [name, secret] of Object.entries(server.headers ?? {})) {
+    headers[name] = resolveHeaderSecret(server.name, name, secret, env)
+  }
+
+  if (server.bearerToken !== undefined) {
+    // Config validation rejects bearerToken alongside any Authorization header,
+    // so this never overwrites an operator-set value.
+    headers.Authorization = `Bearer ${resolveHeaderSecret(server.name, 'bearerToken', server.bearerToken, env)}`
+  }
+
+  return headers
+}
+
+function resolveHeaderSecret(serverName: string, field: string, secret: Secret, env: NodeJS.ProcessEnv): string {
+  const resolved = resolveSecret(secret, undefined, env)
+  if (resolved === undefined || resolved === '') {
+    // Names the field, never the value: this message reaches logs and the model.
+    throw new Error(`MCP server "${serverName}" ${field} could not be resolved; set its value or export its env var`)
+  }
+  return resolved
 }
 
 function requiredUrl(server: McpServer): string {

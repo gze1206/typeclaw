@@ -7,7 +7,15 @@ import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js'
 
 import type { McpServer } from '@/config/config'
 
-import { connectMcpServer, createMcpConnection, createTransport, resolveServerEnv, type McpSdkClient } from './client'
+import {
+  connectMcpServer,
+  createMcpConnection,
+  createTransport,
+  resolveServerEnv,
+  resolveServerHeaders,
+  usesStaticAuthorization,
+  type McpSdkClient,
+} from './client'
 
 describe('resolveServerEnv', () => {
   test('uses target env key before explicit secret env before secret value', () => {
@@ -160,6 +168,92 @@ describe('connectMcpServer', () => {
   })
 })
 
+describe('resolveServerHeaders', () => {
+  test('resolves literal header values', () => {
+    const resolved = resolveServerHeaders({ name: 'acme', headers: { 'X-API-Key': { value: 'literal-key' } } }, {})
+
+    expect(resolved).toEqual({ 'X-API-Key': 'literal-key' })
+  })
+
+  test('resolves an env-referencing header value from the process env', () => {
+    const resolved = resolveServerHeaders(
+      { name: 'acme', headers: { 'X-API-Key': { env: 'ACME_KEY' } } },
+      {
+        ACME_KEY: 'from-env',
+      },
+    )
+
+    expect(resolved).toEqual({ 'X-API-Key': 'from-env' })
+  })
+
+  test('desugars bearerToken into an Authorization header', () => {
+    const resolved = resolveServerHeaders({ name: 'linear', headers: {}, bearerToken: { value: 'tok-123' } }, {})
+
+    expect(resolved).toEqual({ Authorization: 'Bearer tok-123' })
+  })
+
+  test('desugars an env-referencing bearerToken', () => {
+    const resolved = resolveServerHeaders(
+      { name: 'linear', headers: {}, bearerToken: { env: 'LINEAR_TOKEN' } },
+      {
+        LINEAR_TOKEN: 'tok-env',
+      },
+    )
+
+    expect(resolved).toEqual({ Authorization: 'Bearer tok-env' })
+  })
+
+  test('does not read the process env under the raw header name', () => {
+    // Deliberate asymmetry with resolveServerEnv, whose keys ARE env var names
+    // and so get an env-wins override. A header name is an HTTP field name; it
+    // shares no namespace with the process env, and honouring it would let an
+    // unrelated ambient variable silently become a credential.
+    const resolved = resolveServerHeaders(
+      { name: 'acme', headers: { 'X-API-Key': { value: 'from-config' } } },
+      {
+        'X-API-Key': 'from-ambient-env',
+      },
+    )
+
+    expect(resolved).toEqual({ 'X-API-Key': 'from-config' })
+  })
+
+  test('throws without leaking the secret when a header cannot be resolved', () => {
+    // Headers ARE the credential here, so dropping an unresolved one silently
+    // turns a config typo into an opaque 401 at call time.
+    const call = (): Record<string, string> =>
+      resolveServerHeaders({ name: 'acme', headers: { 'X-API-Key': { env: 'MISSING_KEY' } } }, {})
+
+    expect(call).toThrow(/X-API-Key/)
+    expect(call).toThrow(/acme/)
+  })
+
+  test('returns an empty object when no headers or bearerToken are configured', () => {
+    expect(resolveServerHeaders({ name: 'acme', headers: {} }, {})).toEqual({})
+  })
+})
+
+describe('usesStaticAuthorization', () => {
+  test('is true for a bearerToken server', () => {
+    expect(usesStaticAuthorization({ ...httpServer(), bearerToken: { value: 'tok' } })).toBe(true)
+  })
+
+  test('is true for a server that sets its own Authorization header, in any case', () => {
+    expect(usesStaticAuthorization({ ...httpServer(), headers: { Authorization: { value: 'Bearer x' } } })).toBe(true)
+    expect(usesStaticAuthorization({ ...httpServer(), headers: { authorization: { value: 'Bearer x' } } })).toBe(true)
+  })
+
+  test('is false for a server whose headers carry no Authorization', () => {
+    // A non-Authorization header legitimately coexists with OAuth (tenant
+    // routing, tracing), so it must not suppress the auth provider.
+    expect(usesStaticAuthorization({ ...httpServer(), headers: { 'X-Tenant': { value: 'acme' } } })).toBe(false)
+  })
+
+  test('is false for a plain http server', () => {
+    expect(usesStaticAuthorization(httpServer())).toBe(false)
+  })
+})
+
 describe('createTransport', () => {
   test('attaches an auth provider only for HTTP servers when one is provided', () => {
     const authProvider = fakeAuthProvider()
@@ -171,6 +265,27 @@ describe('createTransport', () => {
     expect(objectGraphContains(withAuth, authProvider)).toBe(true)
     expect(objectGraphContains(bare, authProvider)).toBe(false)
     expect(objectGraphContains(stdio, authProvider)).toBe(false)
+  })
+
+  test('passes resolved headers to the HTTP transport as requestInit headers', () => {
+    const transport = createTransport(
+      { ...httpServer(), headers: { 'X-API-Key': { env: 'ACME_KEY' } } },
+      {
+        ACME_KEY: 'from-env',
+      },
+    )
+
+    expect(findRequestInitHeaders(transport)).toEqual({ 'X-API-Key': 'from-env' })
+  })
+
+  test('desugars bearerToken onto the HTTP transport', () => {
+    const transport = createTransport({ ...httpServer(), bearerToken: { value: 'tok-123' } }, {})
+
+    expect(findRequestInitHeaders(transport)).toEqual({ Authorization: 'Bearer tok-123' })
+  })
+
+  test('sends no custom headers when none are configured', () => {
+    expect(findRequestInitHeaders(createTransport(httpServer(), {}))).toBeUndefined()
   })
 })
 
@@ -218,6 +333,13 @@ function fakeAuthProvider(): OAuthClientProvider {
       return 'verifier-test'
     },
   }
+}
+
+// StreamableHTTPClientTransport keeps the constructor's `requestInit` on a
+// private field and merges its headers into every request. Reading it back is
+// the only way to assert the wiring without standing up an HTTP server.
+function findRequestInitHeaders(transport: Transport): Record<string, string> | undefined {
+  return (transport as unknown as { _requestInit?: { headers?: Record<string, string> } })._requestInit?.headers
 }
 
 function objectGraphContains(root: unknown, needle: unknown): boolean {
