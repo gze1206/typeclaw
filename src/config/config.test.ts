@@ -740,6 +740,122 @@ describe('configSchema mcpServers field', () => {
     const issue = result.error.issues.find((i) => i.message.includes('duplicates'))
     expect(issue?.path).toEqual(['mcpServers', 1, 'name'])
   })
+
+  test('accepts custom headers and a bearerToken on an http server', () => {
+    const parsed = configSchema.parse({
+      models: { default: VALID_MODEL },
+      mcpServers: [
+        { name: 'acme', url: 'https://mcp.acme.com/mcp', headers: { 'X-API-Key': { env: 'ACME_KEY' } } },
+        { name: 'linear', url: 'https://mcp.linear.app/mcp', bearerToken: 'tok-123' },
+      ],
+    })
+
+    expect(parsed.mcpServers[0]?.headers).toEqual({ 'X-API-Key': { env: 'ACME_KEY' } })
+    expect(parsed.mcpServers[1]?.bearerToken).toEqual({ value: 'tok-123' })
+  })
+
+  test('rejects headers on a stdio server, where HTTP headers have no meaning', () => {
+    const result = configSchema.safeParse({
+      models: { default: VALID_MODEL },
+      mcpServers: [{ name: 'fs', command: 'server', headers: { 'X-API-Key': 'k' } }],
+    })
+
+    expect(result.success).toBe(false)
+  })
+
+  test('rejects bearerToken on a stdio server', () => {
+    const result = configSchema.safeParse({
+      models: { default: VALID_MODEL },
+      mcpServers: [{ name: 'fs', command: 'server', bearerToken: 'tok-123' }],
+    })
+
+    expect(result.success).toBe(false)
+  })
+
+  test('rejects bearerToken alongside an explicit Authorization header', () => {
+    // Both desugar to the same header; picking a winner silently would hide
+    // whichever the operator meant.
+    const result = configSchema.safeParse({
+      models: { default: VALID_MODEL },
+      mcpServers: [
+        {
+          name: 'linear',
+          url: 'https://mcp.linear.app/mcp',
+          bearerToken: 'tok-123',
+          headers: { Authorization: 'Bearer other' },
+        },
+      ],
+    })
+
+    expect(result.success).toBe(false)
+  })
+
+  test('rejects bearerToken alongside a lowercase authorization header', () => {
+    // HTTP field names are case-insensitive, so the collision check must be too.
+    const result = configSchema.safeParse({
+      models: { default: VALID_MODEL },
+      mcpServers: [
+        {
+          name: 'linear',
+          url: 'https://mcp.linear.app/mcp',
+          bearerToken: 'tok-123',
+          headers: { authorization: 'Bearer other' },
+        },
+      ],
+    })
+
+    expect(result.success).toBe(false)
+  })
+
+  test('rejects a header name that could inject a second header', () => {
+    // A CRLF in a field name would let config smuggle an extra header onto
+    // every request.
+    const result = configSchema.safeParse({
+      models: { default: VALID_MODEL },
+      mcpServers: [
+        { name: 'acme', url: 'https://mcp.acme.com/mcp', headers: { 'X-Foo\r\nAuthorization': 'Bearer x' } },
+      ],
+    })
+
+    expect(result.success).toBe(false)
+  })
+
+  test('accepts allowTools and denyTools as bare tool names', () => {
+    const parsed = configSchema.parse({
+      models: { default: VALID_MODEL },
+      mcpServers: [
+        { name: 'linear', url: 'https://mcp.linear.app/mcp', allowTools: ['search'], denyTools: ['delete'] },
+      ],
+    })
+
+    expect(parsed.mcpServers[0]?.allowTools).toEqual(['search'])
+    expect(parsed.mcpServers[0]?.denyTools).toEqual(['delete'])
+  })
+
+  test('distinguishes an empty allowTools from an absent one', () => {
+    // The schema must preserve [] rather than defaulting it away: [] means "no
+    // tools" and undefined means "all tools".
+    const empty = configSchema.parse({
+      models: { default: VALID_MODEL },
+      mcpServers: [{ name: 'linear', url: 'https://mcp.linear.app/mcp', allowTools: [] }],
+    })
+    const absent = configSchema.parse({
+      models: { default: VALID_MODEL },
+      mcpServers: [{ name: 'linear', url: 'https://mcp.linear.app/mcp' }],
+    })
+
+    expect(empty.mcpServers[0]?.allowTools).toEqual([])
+    expect(absent.mcpServers[0]?.allowTools).toBeUndefined()
+  })
+
+  test('leaves headers unset rather than defaulting them onto stdio servers', () => {
+    const parsed = configSchema.parse({
+      models: { default: VALID_MODEL },
+      mcpServers: [{ name: 'fs', command: 'server' }],
+    })
+
+    expect(parsed.mcpServers[0]?.headers).toBeUndefined()
+  })
 })
 
 describe('configSchema alias field', () => {

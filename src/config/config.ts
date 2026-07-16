@@ -60,6 +60,12 @@ const MOUNT_NAME_PATTERN = /^[a-z0-9][a-z0-9-_]*$/
 // would be silently dropped or corrupt the spawned server's env.
 const ENV_NAME_PATTERN = /^[A-Za-z_][A-Za-z0-9_]*$/
 
+// RFC 7230 field-name token. MCP `headers` keys are written verbatim onto every
+// HTTP request, so anything outside this set — most importantly CR/LF — would let
+// a config file smuggle an extra header (or an entire request line) past the
+// caller's intent.
+const HTTP_HEADER_NAME_PATTERN = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/
+
 // Upper bound for a per-server MCP request timeout: 10 minutes. Long-running
 // MCP tools (large crawls, builds) can legitimately take minutes, but a ceiling
 // guards against fat-finger values that would re-introduce the unbounded-hang
@@ -92,6 +98,13 @@ export type Mount = z.infer<typeof mountSchema>
 // XOR on purpose: stdio servers are child processes (`command` + `args` + env),
 // while Streamable HTTP servers are remote endpoints (`url`); accepting both
 // would make ownership, lifetime, and credential injection ambiguous at boot.
+// HTTP field names are case-insensitive (RFC 7230), so `authorization` and
+// `Authorization` are the same header and both collide with `bearerToken`.
+function hasAuthorizationHeader(headers: Record<string, unknown> | undefined): boolean {
+  if (headers === undefined) return false
+  return Object.keys(headers).some((name) => name.toLowerCase() === 'authorization')
+}
+
 export const mcpServerSchema = z
   .object({
     name: z
@@ -116,9 +129,34 @@ export const mcpServerSchema = z
     env: z
       .record(z.string().regex(ENV_NAME_PATTERN, 'env var name must be a valid identifier'), secretFieldSchema)
       .default({}),
+    // Static HTTP auth. Not defaulted to `{}`: these are http-only, and
+    // materialising an empty map on every stdio server would imply a field that
+    // is rejected there. `bearerToken` is sugar that resolveServerHeaders
+    // desugars into `Authorization: Bearer <token>`, so the runtime has exactly
+    // one header path — it exists because a Secret should hold the token, not
+    // the `Bearer ` prefix.
+    headers: z
+      .record(
+        z.string().regex(HTTP_HEADER_NAME_PATTERN, 'header name must be a valid HTTP field name'),
+        secretFieldSchema,
+      )
+      .optional(),
+    bearerToken: secretFieldSchema.optional(),
+    // Bare tool names (`create_issue`), not namespaced ids — the server is already
+    // fixed by the enclosing block. Neither list is defaulted: an ABSENT
+    // allowTools means "every tool", an EMPTY one means "no tools", and a default
+    // would erase that distinction. See src/mcp/tool-policy.ts.
+    allowTools: z.array(z.string().min(1)).optional(),
+    denyTools: z.array(z.string().min(1)).optional(),
   })
   .refine((server) => (server.command !== undefined) !== (server.url !== undefined), {
     message: 'MCP server must be either stdio (command) or http (url), not both or neither',
+  })
+  .refine((server) => server.url !== undefined || (server.headers === undefined && server.bearerToken === undefined), {
+    message: 'MCP server headers/bearerToken are http-only; a stdio (command) server cannot send HTTP headers',
+  })
+  .refine((server) => server.bearerToken === undefined || !hasAuthorizationHeader(server.headers), {
+    message: 'MCP server cannot set both bearerToken and an Authorization header; they resolve to the same header',
   })
 
 export type McpServer = z.infer<typeof mcpServerSchema>
