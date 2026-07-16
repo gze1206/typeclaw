@@ -6,8 +6,20 @@ import { join } from 'node:path'
 import type { OAuthDiscoveryState } from '@modelcontextprotocol/sdk/client/auth.js'
 import type { OAuthClientInformationMixed, OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth.js'
 
+import type { McpCredential } from '@/secrets/schema'
+import { SecretsBackend } from '@/secrets/storage'
+
 import { authRecoveryHint, McpOAuthRequiredError } from './auth-state'
-import { createFileMcpOAuthStore, TypeClawMcpOAuthProvider } from './oauth'
+import { createFileMcpOAuthStore, createHostdMcpOAuthStore, TypeClawMcpOAuthProvider } from './oauth'
+
+// Stands in for hostd persisting the patch to the bind-mounted secrets file,
+// which is what the container-side store reads back through.
+async function backendWrite(secretsPath: string, server: string, credential: McpCredential): Promise<void> {
+  await new SecretsBackend(secretsPath).updateMcpAsync(async (mcp) => ({
+    result: undefined,
+    next: { ...mcp, [server]: credential },
+  }))
+}
 
 describe('TypeClawMcpOAuthProvider', () => {
   let dir: string
@@ -120,6 +132,68 @@ describe('TypeClawMcpOAuthProvider', () => {
     await expect(provider.redirectToAuthorization(new URL('https://mcp.example.com/oauth'))).rejects.toBeInstanceOf(
       McpOAuthRequiredError,
     )
+  })
+
+  test('serialises concurrent hostd writes so they cannot clobber each other', async () => {
+    // The hostd store's patch() reads the credential, then awaits an HTTP write.
+    // Two writes racing across that await each build their patch from a snapshot
+    // taken BEFORE the other landed, so the later write silently reverts the
+    // earlier one — which, for a token rotation, destroys a working credential.
+    const writes: McpCredential[] = []
+    let releaseFirstWrite: (() => void) | undefined
+    const firstWriteStarted = new Promise<void>((resolve) => {
+      releaseFirstWrite = resolve
+    })
+    const store = createHostdMcpOAuthStore({
+      hostdUrl: 'http://hostd.test',
+      restartToken: 'token',
+      containerName: 'agent',
+      secretsPath,
+      async send(server, credential) {
+        writes.push(credential)
+        // Hold the first write open to force the interleaving the queue exists
+        // to prevent; without serialisation the second read happens right here.
+        if (writes.length === 1) await firstWriteStarted
+        await backendWrite(secretsPath, server, credential)
+      },
+    })
+
+    const tokensWrite = store.saveTokens('linear', {
+      access_token: 'access-1',
+      token_type: 'Bearer',
+    })
+    const clientWrite = store.saveClient('linear', { client_id: 'client-1' })
+    releaseFirstWrite?.()
+    await Promise.all([tokensWrite, clientWrite])
+
+    const final = writes[writes.length - 1]
+    expect(final?.tokens).toEqual({ access_token: 'access-1', token_type: 'Bearer' })
+    expect(final?.client).toEqual({ client_id: 'client-1' })
+  })
+
+  test('keeps the hostd write queue running after one write fails', async () => {
+    const writes: string[] = []
+    const store = createHostdMcpOAuthStore({
+      hostdUrl: 'http://hostd.test',
+      restartToken: 'token',
+      containerName: 'agent',
+      secretsPath,
+      async send(server, credential) {
+        if (writes.length === 0) {
+          writes.push('failed')
+          throw new Error('secrets-patch rejected')
+        }
+        writes.push('succeeded')
+        await backendWrite(secretsPath, server, credential)
+      },
+    })
+
+    await expect(store.saveTokens('linear', { access_token: 'a', token_type: 'Bearer' })).rejects.toThrow(
+      'secrets-patch rejected',
+    )
+    await store.saveClient('linear', { client_id: 'client-1' })
+
+    expect(writes).toEqual(['failed', 'succeeded'])
   })
 
   test('exposes public-client metadata for SDK dynamic client registration', () => {

@@ -134,21 +134,51 @@ export type HostdMcpOAuthStoreOptions = {
   restartToken: string
   containerName: string
   secretsPath: string
+  // Seam for tests. Production always goes through hostd over HTTP.
+  send?: (server: string, credential: McpCredential) => Promise<void>
 }
 
 export function createHostdMcpOAuthStore(options: HostdMcpOAuthStoreOptions): McpOAuthStore {
   const backend = new SecretsBackend(options.secretsPath)
-  const write = async (server: string, credential: McpCredential): Promise<void> => {
-    const request: Extract<Request, { kind: 'secrets-patch' }> = {
-      kind: 'secrets-patch',
-      containerName: options.containerName,
-      patch: { mcp: { server, credential } },
-    }
-    const response = await sendHttp(request, { url: options.hostdUrl, token: options.restartToken })
-    if (!response.ok) throw new Error(`secrets-patch failed: ${response.reason}`)
+  const send =
+    options.send ??
+    (async (server: string, credential: McpCredential): Promise<void> => {
+      const request: Extract<Request, { kind: 'secrets-patch' }> = {
+        kind: 'secrets-patch',
+        containerName: options.containerName,
+        patch: { mcp: { server, credential } },
+      }
+      const response = await sendHttp(request, { url: options.hostdUrl, token: options.restartToken })
+      if (!response.ok) throw new Error(`secrets-patch failed: ${response.reason}`)
+    })
+
+  // Serialise per server. Each patch reads the current credential, then awaits a
+  // round-trip to hostd — and concurrent writes across that await would each
+  // build their patch from a snapshot taken before the other landed, so the
+  // later write reverts the earlier one. For a token rotation racing a client
+  // save, that silently destroys a working credential. The file-backed store
+  // needs none of this: updateMcpAsync already holds a lock across its
+  // read-modify-write.
+  const queues = new Map<string, Promise<unknown>>()
+  const serialise = async (server: string, task: () => Promise<void>): Promise<void> => {
+    // Chain off the tail, swallowing the predecessor's rejection so one failed
+    // write cannot wedge the queue for every later write.
+    const tail = (queues.get(server) ?? Promise.resolve()).then(
+      () => {},
+      () => {},
+    )
+    const run = tail.then(task)
+    queues.set(
+      server,
+      run.catch(() => {}),
+    )
+    return run
   }
+
   const patch = async (server: string, fieldPatch: McpCredential): Promise<void> => {
-    await write(server, { ...backend.readMcpCredentialSync(server), ...fieldPatch })
+    await serialise(server, async () => {
+      await send(server, { ...backend.readMcpCredentialSync(server), ...fieldPatch })
+    })
   }
   return {
     get(server) {
@@ -164,9 +194,11 @@ export function createHostdMcpOAuthStore(options: HostdMcpOAuthStoreOptions): Mc
       await patch(server, { discovery })
     },
     async invalidate(server, scope) {
-      const credential = invalidateCredential(backend.readMcpCredentialSync(server), scope)
-      if (credential === undefined) return
-      await write(server, credential)
+      await serialise(server, async () => {
+        const credential = invalidateCredential(backend.readMcpCredentialSync(server), scope)
+        if (credential === undefined) return
+        await send(server, credential)
+      })
     },
   }
 }
