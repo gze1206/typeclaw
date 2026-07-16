@@ -12,6 +12,8 @@ import type { Request } from '@/hostd/protocol'
 import type { McpCredential, McpSlice } from '@/secrets/schema'
 import { SecretsBackend } from '@/secrets/storage'
 
+import { McpOAuthRequiredError } from './auth-state'
+
 export type McpOAuthInvalidateScope = Parameters<NonNullable<OAuthClientProvider['invalidateCredentials']>>[0]
 
 export interface McpOAuthStore {
@@ -94,11 +96,10 @@ export class TypeClawMcpOAuthProvider implements OAuthClientProvider {
   }
 
   async redirectToAuthorization(url: URL): Promise<void> {
-    if (this.opts.mode === 'container') {
-      throw new Error(
-        `MCP server "${this.serverName}" needs OAuth. Run on the host: typeclaw mcp auth ${this.serverName}`,
-      )
-    }
+    // No browser exists in the container, so the only way forward is a human on
+    // the host. A typed error (rather than a bare Error) lets the dispatcher
+    // classify this without matching on message text.
+    if (this.opts.mode === 'container') throw new McpOAuthRequiredError(this.serverName)
     this.opts.onRedirect?.(url)
   }
 

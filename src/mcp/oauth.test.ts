@@ -6,6 +6,7 @@ import { join } from 'node:path'
 import type { OAuthDiscoveryState } from '@modelcontextprotocol/sdk/client/auth.js'
 import type { OAuthClientInformationMixed, OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth.js'
 
+import { authRecoveryHint, McpOAuthRequiredError } from './auth-state'
 import { createFileMcpOAuthStore, TypeClawMcpOAuthProvider } from './oauth'
 
 describe('TypeClawMcpOAuthProvider', () => {
@@ -77,6 +78,24 @@ describe('TypeClawMcpOAuthProvider', () => {
     expect(JSON.stringify(raw)).not.toContain(state)
   })
 
+  test('fixes the CSRF state at construction so the SDK and the auth flow agree on one value', async () => {
+    // Regression: a lazily-minted state meant the auth flow's own
+    // `await provider.state()` could be the FIRST caller — minting a fresh UUID
+    // that the authorization URL never carried — and the comparison against the
+    // callback's state then validated nothing.
+    const provider = new TypeClawMcpOAuthProvider('linear', createFileMcpOAuthStore(secretsPath), {
+      mode: 'host',
+      redirectUrl: 'http://localhost:1456/callback',
+      clientName: 'typeclaw',
+    })
+
+    const first = await provider.state()
+    const second = await provider.state()
+
+    expect(first).toBe(second)
+    expect(first).not.toBe('')
+  })
+
   test('throws an actionable host command instead of opening a browser in container mode', async () => {
     const provider = new TypeClawMcpOAuthProvider('linear', createFileMcpOAuthStore(secretsPath), {
       mode: 'container',
@@ -84,8 +103,22 @@ describe('TypeClawMcpOAuthProvider', () => {
       clientName: 'typeclaw',
     })
 
+    // Shares one wording with every other surface that reports this condition,
+    // so the runtime and the CLI cannot drift into two different instructions.
     await expect(provider.redirectToAuthorization(new URL('https://mcp.example.com/oauth'))).rejects.toThrow(
-      'MCP server "linear" needs OAuth. Run on the host: typeclaw mcp auth linear',
+      authRecoveryHint('linear'),
+    )
+  })
+
+  test('throws a typed error in container mode so callers classify it without matching text', async () => {
+    const provider = new TypeClawMcpOAuthProvider('linear', createFileMcpOAuthStore(secretsPath), {
+      mode: 'container',
+      redirectUrl: 'http://localhost:1456/callback',
+      clientName: 'typeclaw',
+    })
+
+    await expect(provider.redirectToAuthorization(new URL('https://mcp.example.com/oauth'))).rejects.toBeInstanceOf(
+      McpOAuthRequiredError,
     )
   })
 
