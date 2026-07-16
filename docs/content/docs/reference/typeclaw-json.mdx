@@ -14,6 +14,7 @@ JSON Schema–validated. `typeclaw init` scaffolds a `$schema` pointer at `./nod
 | `port`                  | `number`                                        | restart-required                             | preferred host port; CLI falls back to ephemeral on conflict                             |
 | `mounts`                | `Mount[]`                                       | restart-required                             | host files or directories exposed inside the container                                   |
 | `plugins`               | `string[]`                                      | restart-required                             | plugin module specifiers                                                                 |
+| `mcpServers`            | `McpServer[]`                                   | restart-required                             | external MCP servers over stdio or HTTP                                                  |
 | `alias`                 | `string[]`                                      | live                                         | additional names the agent answers to in channels                                        |
 | `channels`              | `Record<adapter, AdapterConfig>`                | live                                         | per-adapter config                                                                       |
 | `portForward`           | `{ allow, deny? }`                              | restart-required                             | auto port-forward allow/deny lists; default `{ allow: '*' }`                             |
@@ -140,6 +141,75 @@ typeclaw mount add downloads ~/Downloads --read-only
 typeclaw mount list
 typeclaw mount remove downloads
 ```
+
+## `mcpServers`
+
+Each entry is either a **stdio** server (`command`) or an **HTTP** server (`url`) — exactly one, never both.
+
+```json
+{
+  "mcpServers": [
+    {
+      "name": "filesystem",
+      "command": "bunx",
+      "args": ["@modelcontextprotocol/server-filesystem", "/agent/workspace"],
+      "env": { "FS_ROOT": { "env": "FS_ROOT" } }
+    },
+    {
+      "name": "acme",
+      "url": "https://mcp.acme.com/mcp",
+      "headers": { "X-API-Key": { "env": "ACME_KEY" } },
+      "denyTools": ["delete_project"]
+    }
+  ]
+}
+```
+
+| Field         | Type                     | Notes                                                                            |
+| ------------- | ------------------------ | -------------------------------------------------------------------------------- |
+| `name`        | `string`                 | lowercase alphanumeric plus `-`/`_`; `__` is reserved as the tool-name separator |
+| `description` | `string`                 | shown in the agent's MCP catalog                                                 |
+| `enabled`     | `boolean`                | default `true`; `false` keeps the config but skips connecting                    |
+| `timeoutMs`   | `number`                 | per-request timeout, max 600000 (10 min); default 30000                          |
+| `command`     | `string`                 | stdio only                                                                       |
+| `args`        | `string[]`               | stdio only                                                                       |
+| `url`         | `string`                 | http/https only                                                                  |
+| `env`         | `Record<string, Secret>` | stdio only — see the env allowlist note below                                    |
+| `headers`     | `Record<string, Secret>` | **http only** — static request headers                                           |
+| `bearerToken` | `Secret`                 | **http only** — sugar for `Authorization: Bearer <token>`                        |
+| `allowTools`  | `string[]`               | bare tool names; when set, only these are exposed                                |
+| `denyTools`   | `string[]`               | bare tool names; blocked even if `allowTools` lists them                         |
+
+### Authentication
+
+HTTP servers authenticate one of two ways:
+
+- **Static headers** — `headers` and/or `bearerToken`. `bearerToken: "tok"` is exactly
+  `headers: { "Authorization": "Bearer tok" }`, and setting both is rejected rather than
+  silently resolved. Values are `Secret`s, so `{ "env": "ACME_KEY" }` reads from the
+  process env. An unresolvable header fails the connection loudly instead of being dropped
+  — headers _are_ the credential, and a dropped one only resurfaces as an opaque 401.
+- **OAuth** — run `typeclaw mcp auth <name>` on the **host**; tokens land in `secrets.json`.
+  A server carrying its own `Authorization` header needs no OAuth and gets no auth provider.
+  Other custom headers (tenant routing, tracing) coexist with OAuth fine.
+
+`typeclaw mcp list` reports the per-server auth state; `typeclaw mcp logout <name>` clears it.
+
+### Tool gating
+
+`allowTools`/`denyTools` take **bare** tool names (`create_issue`), not namespaced ids —
+the enclosing block already fixes the server. `denyTools` wins over `allowTools`. An
+**absent** `allowTools` means "every tool"; an **empty** one means "no tools". Gated tools
+are hidden from `mcp_list_tools`, answer as unknown in `mcp_describe`, and are refused by
+`mcp_call` **before** the request reaches the server, so a denied call cannot have a side
+effect. There is no glob support.
+
+### stdio env
+
+A stdio server is a child process, and it does **not** inherit the agent's environment: only
+`PATH`, `HOME`, `LANG`, `LC_ALL`, `TMPDIR`, `TZ` pass through, plus whatever the server
+declares in `env`. That keeps `OPENAI_API_KEY`, channel tokens, and every other ambient
+credential out of third-party server processes.
 
 ## `docker.file`
 

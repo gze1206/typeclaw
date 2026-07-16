@@ -57,7 +57,7 @@
 ## Extensibility — teach it new tricks in TypeScript
 
 - 🔌 **Plugins are just imports** — a plugin is a plain TypeScript file that imports the runtime and adds tools, skills, channels, and commands; no IPC, no FFI, no DSL, distributed as packages and resolved like any dependency
-- 🛰 **MCP support** — connect external MCP servers over stdio or HTTP; their tools become the agent's tools
+- 🛰 **MCP support** — connect external MCP servers over stdio or HTTP; their tools become the agent's tools. HTTP servers authenticate with OAuth (`typeclaw mcp auth`) or static headers/bearer tokens, and per-server `allowTools`/`denyTools` keep a third-party server to the tools you meant to grant it
 - 📚 **Skills on demand** — markdown procedures load lazily when selected, so they avoid prompt-token cost until used; skills layer from bundled, your own, and what the agent learns
 - ⚙️ **Typed config with hot reload** — most config changes take effect live; boot-only fields are flagged restart-required
 
