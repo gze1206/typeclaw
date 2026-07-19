@@ -1796,6 +1796,33 @@ describe('wrapSystemTool', () => {
     }
   })
 
+  test('snapshots a Bun-style hardlinked package skill reference', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-package-skill-reference-hardlink-'))
+    const cacheFile = path.join(agentDir, 'bun-cache-reference.md')
+    const reference = path.join(
+      agentDir,
+      'node_modules',
+      'example-package',
+      'skills',
+      'example',
+      'references',
+      'auth-login.md',
+    )
+    await mkdir(path.dirname(reference), { recursive: true })
+    await writeFile(path.join(agentDir, 'node_modules', 'example-package', 'skills', 'example', 'SKILL.md'), 'skill')
+    await writeFile(cacheFile, 'package skill reference')
+    await link(cacheFile, reference)
+    const args: Record<string, unknown> = { path: reference }
+    try {
+      expect((await stat(reference)).nlink).toBe(2)
+      const pinned = await enforceAndPinToolFiles({ tool: 'read', args, agentDir })
+      expect(await readFile(args.path as string, 'utf8')).toBe('package skill reference')
+      await pinned.cleanup()
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
+
   test('keeps a hardlinked non-skill package file blocked', async () => {
     const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-package-nonskill-hardlink-'))
     const cacheFile = path.join(agentDir, 'bun-cache-readme.md')

@@ -813,7 +813,9 @@ async function isInstalledPackageSkill(agentDir: string, resolved: string): Prom
   const packageSegments = segments[0]?.startsWith('@') === true ? 2 : 1
   if (segments.length < packageSegments + 3) return false
   if (segments[0] === '' || segments[0] === '.' || segments[packageSegments - 1] === undefined) return false
-  return segments[packageSegments] === 'skills' && segments.at(-1) === 'SKILL.md'
+  if (segments[packageSegments] !== 'skills' || segments[packageSegments + 1] === undefined) return false
+  const manifest = path.join(nodeModules, ...segments.slice(0, packageSegments + 2), 'SKILL.md')
+  return (await stat(manifest).catch(() => undefined))?.isFile() === true
 }
 
 function assertSingleLinkRegularFile(stats: Stats, original: string, allowHardlinks = false): void {
