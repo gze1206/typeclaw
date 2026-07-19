@@ -14,6 +14,7 @@ import {
   listMcpCredentials,
   parseCodeInput,
   runMcpAuthFlow,
+  resolveStaticMcpOAuthClient,
   TypeClawMcpOAuthProvider,
   type McpAuthCodeInput,
   type McpAuthFlowOutcome,
@@ -133,11 +134,17 @@ async function runMcpAuthCommand(
   const secretsPath = join(cwd, 'secrets.json')
   const store = createFileMcpOAuthStore(secretsPath)
   const redirectUrl = `http://localhost:${opts.port}/callback`
+  let staticClient
+  try {
+    staticClient = resolveStaticMcpOAuthClient(server, process.env, redirectUrl)
+  } catch (cause) {
+    return { ok: false, reason: cause instanceof Error ? cause.message : String(cause) }
+  }
 
   // A registration minted on another port would be rejected at the AS on exact
   // redirect_uri match, so drop it and let dynamic registration re-mint.
   const existing = await store.get(serverName)
-  if (!clientRegistrationAcceptsRedirect(existing?.client, redirectUrl)) {
+  if (staticClient === undefined && !clientRegistrationAcceptsRedirect(existing?.client, redirectUrl)) {
     await store.invalidate(serverName, 'client')
   }
 
@@ -146,6 +153,7 @@ async function runMcpAuthCommand(
     mode: 'host',
     redirectUrl,
     clientName: 'typeclaw',
+    ...(staticClient === undefined ? {} : { staticClient }),
     onRedirect: (url) => {
       authorizationUrl = url
     },

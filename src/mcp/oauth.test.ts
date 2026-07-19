@@ -6,11 +6,17 @@ import { join } from 'node:path'
 import type { OAuthDiscoveryState } from '@modelcontextprotocol/sdk/client/auth.js'
 import type { OAuthClientInformationMixed, OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth.js'
 
+import { mcpServerSchema } from '@/config/config'
 import type { McpCredential } from '@/secrets/schema'
 import { SecretsBackend } from '@/secrets/storage'
 
 import { authRecoveryHint, McpOAuthRequiredError } from './auth-state'
-import { createFileMcpOAuthStore, createHostdMcpOAuthStore, TypeClawMcpOAuthProvider } from './oauth'
+import {
+  createFileMcpOAuthStore,
+  createHostdMcpOAuthStore,
+  resolveStaticMcpOAuthClient,
+  TypeClawMcpOAuthProvider,
+} from './oauth'
 
 // Stands in for hostd persisting the patch to the bind-mounted secrets file,
 // which is what the container-side store reads back through.
@@ -70,6 +76,27 @@ describe('TypeClawMcpOAuthProvider', () => {
     expect(await reloaded.discoveryState()).toEqual(discovery)
     const raw = JSON.parse(await readFile(secretsPath, 'utf8')) as { mcp: Record<string, { tokens?: unknown }> }
     expect(raw.mcp.linear?.tokens).toEqual(rotated)
+  })
+
+  test('uses configured static client information instead of a persisted DCR registration', async () => {
+    const store = createFileMcpOAuthStore(secretsPath)
+    await store.saveClient('calendar', { client_id: 'dynamic-client' })
+    const provider = new TypeClawMcpOAuthProvider('calendar', store, {
+      mode: 'host',
+      redirectUrl: 'http://localhost:1456/callback',
+      clientName: 'typeclaw',
+      staticClient: {
+        clientId: 'calendar-client',
+        redirectUri: 'http://localhost:1456/callback',
+        scope: 'calendar.events',
+      },
+    })
+
+    expect(await provider.clientInformation()).toEqual({
+      client_id: 'calendar-client',
+      redirect_uris: ['http://localhost:1456/callback'],
+    })
+    expect(provider.clientMetadata.scope).toBe('calendar.events')
   })
 
   test('keeps PKCE verifier and state ephemeral instead of writing them to secrets.json', async () => {
@@ -211,6 +238,48 @@ describe('TypeClawMcpOAuthProvider', () => {
       response_types: ['code'],
       token_endpoint_auth_method: 'none',
       scope: 'read write',
+    })
+  })
+})
+
+describe('resolveStaticMcpOAuthClient', () => {
+  test('resolves a configured client secret and validates its callback URI', () => {
+    const server = mcpServerSchema.parse({
+      name: 'calendar',
+      url: 'https://calendar.example.com/mcp',
+      oauth: {
+        clientId: 'calendar-client',
+        clientSecret: { env: 'CALENDAR_CLIENT_SECRET' },
+        redirectUri: 'http://localhost:1456/callback',
+        scope: 'calendar.events',
+      },
+    })
+
+    expect(
+      resolveStaticMcpOAuthClient(
+        server,
+        { CALENDAR_CLIENT_SECRET: 'calendar-secret' },
+        'http://localhost:1456/callback',
+      ),
+    ).toEqual({
+      clientId: 'calendar-client',
+      clientSecret: 'calendar-secret',
+      redirectUri: 'http://localhost:1456/callback',
+      scope: 'calendar.events',
+    })
+    expect(() => resolveStaticMcpOAuthClient(server, {}, 'http://localhost:1457/callback')).toThrow(/redirect/i)
+  })
+
+  test('uses the active callback URI when a static client leaves it implicit', () => {
+    const server = mcpServerSchema.parse({
+      name: 'calendar',
+      url: 'https://calendar.example.test/mcp',
+      oauth: { clientId: 'calendar-client' },
+    })
+
+    expect(resolveStaticMcpOAuthClient(server, {}, 'http://localhost:1456/callback')).toEqual({
+      clientId: 'calendar-client',
+      redirectUri: 'http://localhost:1456/callback',
     })
   })
 })

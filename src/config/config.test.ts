@@ -754,6 +754,51 @@ describe('configSchema mcpServers field', () => {
     expect(parsed.mcpServers[1]?.bearerToken).toEqual({ value: 'tok-123' })
   })
 
+  test('accepts a pre-registered OAuth client on an http server', () => {
+    const parsed = configSchema.parse({
+      models: { default: VALID_MODEL },
+      mcpServers: [
+        {
+          name: 'calendar',
+          url: 'https://calendar.example.com/mcp',
+          oauth: {
+            clientId: 'calendar-client',
+            clientSecret: { env: 'CALENDAR_CLIENT_SECRET' },
+            redirectUri: 'http://localhost:1456/callback',
+            scope: 'calendar.events',
+          },
+        },
+      ],
+    })
+
+    expect(parsed.mcpServers[0]?.oauth).toEqual({
+      clientId: 'calendar-client',
+      clientSecret: { env: 'CALENDAR_CLIENT_SECRET' },
+      redirectUri: 'http://localhost:1456/callback',
+      scope: 'calendar.events',
+    })
+  })
+
+  test.each([
+    {
+      name: 'empty client id',
+      server: { url: 'https://calendar.example.com/mcp', oauth: { clientId: '  ' } },
+      error: /client/i,
+    },
+    {
+      name: 'stdio server',
+      server: { command: 'calendar-mcp', oauth: { clientId: 'calendar-client' } },
+      error: /http/i,
+    },
+    {
+      name: 'static bearer authentication',
+      server: { url: 'https://calendar.example.com/mcp', bearerToken: 'token', oauth: { clientId: 'calendar-client' } },
+      error: /authorization|oauth/i,
+    },
+  ])('rejects OAuth configuration on $name', ({ server, error }) => {
+    expect(() => mcpServerSchema.parse({ name: 'calendar', ...server })).toThrow(error)
+  })
+
   test('rejects headers on a stdio server, where HTTP headers have no meaning', () => {
     const result = configSchema.safeParse({
       models: { default: VALID_MODEL },

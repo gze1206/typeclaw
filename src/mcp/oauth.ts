@@ -7,8 +7,10 @@ import type {
   OAuthTokens,
 } from '@modelcontextprotocol/sdk/shared/auth.js'
 
+import type { McpServer } from '@/config/config'
 import { sendHttp } from '@/hostd/client'
 import type { Request } from '@/hostd/protocol'
+import { resolveSecret } from '@/secrets/resolve'
 import type { McpCredential, McpSlice } from '@/secrets/schema'
 import { SecretsBackend } from '@/secrets/storage'
 
@@ -29,7 +31,42 @@ export type TypeClawMcpOAuthProviderOptions = {
   redirectUrl: string
   clientName: string
   scope?: string
+  staticClient?: StaticMcpOAuthClient
   onRedirect?: (url: URL) => void
+}
+
+export type StaticMcpOAuthClient = {
+  clientId: string
+  clientSecret?: string
+  redirectUri?: string
+  scope?: string
+}
+
+export function resolveStaticMcpOAuthClient(
+  server: McpServer,
+  env: NodeJS.ProcessEnv,
+  callbackUrl: string,
+): StaticMcpOAuthClient | undefined {
+  const oauth = server.oauth
+  if (oauth === undefined) return undefined
+  if (oauth.redirectUri !== undefined && oauth.redirectUri !== callbackUrl) {
+    throw new Error(
+      `MCP server "${server.name}" OAuth redirect URI is ${oauth.redirectUri}, but this authentication uses ${callbackUrl}`,
+    )
+  }
+  const clientSecret = oauth.clientSecret === undefined ? undefined : resolveSecret(oauth.clientSecret, undefined, env)
+  if (oauth.clientSecret !== undefined && clientSecret === undefined) {
+    throw new Error(`MCP server "${server.name}" OAuth clientSecret could not be resolved`)
+  }
+  return {
+    clientId: oauth.clientId,
+    ...(clientSecret === undefined ? {} : { clientSecret }),
+    // A pre-registered client must identify the same callback URI that the
+    // provider advertises. When the config leaves it implicit, that URI is the
+    // active callback for the current host/container flow.
+    redirectUri: oauth.redirectUri ?? callbackUrl,
+    ...(oauth.scope === undefined ? {} : { scope: oauth.scope }),
+  }
 }
 
 export class TypeClawMcpOAuthProvider implements OAuthClientProvider {
@@ -53,15 +90,30 @@ export class TypeClawMcpOAuthProvider implements OAuthClientProvider {
       grant_types: ['authorization_code', 'refresh_token'],
       response_types: ['code'],
       token_endpoint_auth_method: 'none',
-      ...(this.opts.scope === undefined ? {} : { scope: this.opts.scope }),
+      ...((this.opts.staticClient?.scope ?? this.opts.scope) === undefined
+        ? {}
+        : { scope: this.opts.staticClient?.scope ?? this.opts.scope }),
     }
   }
 
   async clientInformation(): Promise<OAuthClientInformationMixed | undefined> {
+    const configured = this.opts.staticClient
+    if (configured !== undefined) {
+      return {
+        client_id: configured.clientId,
+        ...(configured.clientSecret === undefined ? {} : { client_secret: configured.clientSecret }),
+        ...(configured.redirectUri === undefined ? {} : { redirect_uris: [configured.redirectUri] }),
+      }
+    }
     return (await this.store.get(this.serverName))?.client as OAuthClientInformationMixed | undefined
   }
 
   async saveClientInformation(info: OAuthClientInformationMixed): Promise<void> {
+    if (this.opts.staticClient !== undefined) {
+      throw new Error(
+        `MCP server "${this.serverName}" is configured with a static OAuth client and cannot register dynamically`,
+      )
+    }
     await this.store.saveClient(this.serverName, info)
   }
 

@@ -24,10 +24,12 @@ export {
   createHostdMcpOAuthStore,
   listMcpCredentials,
   resolveContainerMcpOAuthStore,
+  resolveStaticMcpOAuthClient,
   TypeClawMcpOAuthProvider,
   type HostdMcpOAuthStoreOptions,
   type McpOAuthInvalidateScope,
   type McpOAuthStore,
+  type StaticMcpOAuthClient,
   type TypeClawMcpOAuthProviderOptions,
 } from './oauth'
 export {

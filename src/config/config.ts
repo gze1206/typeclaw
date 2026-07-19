@@ -105,6 +105,17 @@ function hasAuthorizationHeader(headers: Record<string, unknown> | undefined): b
   return Object.keys(headers).some((name) => name.toLowerCase() === 'authorization')
 }
 
+const mcpOAuthSchema = z.object({
+  clientId: z.string().trim().min(1, 'MCP OAuth clientId must not be empty'),
+  clientSecret: secretFieldSchema.optional(),
+  redirectUri: z
+    .string()
+    .url()
+    .refine((uri) => isHttpProtocol(uri), { message: 'MCP OAuth redirectUri must use http:// or https://' })
+    .optional(),
+  scope: z.string().trim().min(1, 'MCP OAuth scope must not be empty').optional(),
+})
+
 export const mcpServerSchema = z
   .object({
     name: z
@@ -142,6 +153,7 @@ export const mcpServerSchema = z
       )
       .optional(),
     bearerToken: secretFieldSchema.optional(),
+    oauth: mcpOAuthSchema.optional(),
     // Bare tool names (`create_issue`), not namespaced ids — the server is already
     // fixed by the enclosing block. Neither list is defaulted: an ABSENT
     // allowTools means "every tool", an EMPTY one means "no tools", and a default
@@ -158,6 +170,14 @@ export const mcpServerSchema = z
   .refine((server) => server.bearerToken === undefined || !hasAuthorizationHeader(server.headers), {
     message: 'MCP server cannot set both bearerToken and an Authorization header; they resolve to the same header',
   })
+  .refine(
+    (server) =>
+      server.oauth === undefined ||
+      (server.url !== undefined && server.bearerToken === undefined && !hasAuthorizationHeader(server.headers)),
+    {
+      message: 'MCP server oauth is http-only and cannot be combined with static Authorization authentication',
+    },
+  )
 
 export type McpServer = z.infer<typeof mcpServerSchema>
 

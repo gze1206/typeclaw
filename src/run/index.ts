@@ -59,6 +59,7 @@ import { CLI_VERSION } from '@/init/cli-version'
 import {
   createMcpManager,
   resolveContainerMcpOAuthStore,
+  resolveStaticMcpOAuthClient,
   TypeClawMcpOAuthProvider,
   usesStaticAuthorization,
 } from '@/mcp'
@@ -270,6 +271,7 @@ async function startAgentRuntime(
                   mode: 'container',
                   redirectUrl: 'http://localhost:1456/callback',
                   clientName: 'typeclaw',
+                  staticClient: resolveStaticMcpOAuthClient(server, process.env, 'http://localhost:1456/callback'),
                 }),
         })
       : null

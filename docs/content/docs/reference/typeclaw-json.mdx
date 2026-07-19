@@ -160,25 +160,36 @@ Each entry is either a **stdio** server (`command`) or an **HTTP** server (`url`
       "url": "https://mcp.acme.com/mcp",
       "headers": { "X-API-Key": { "env": "ACME_KEY" } },
       "denyTools": ["delete_project"]
+    },
+    {
+      "name": "calendar",
+      "url": "https://calendar.example.com/mcp",
+      "oauth": {
+        "clientId": "pre-registered-client-id",
+        "clientSecret": { "env": "CALENDAR_CLIENT_SECRET" },
+        "redirectUri": "http://localhost:1456/callback",
+        "scope": "calendar.events"
+      }
     }
   ]
 }
 ```
 
-| Field         | Type                     | Notes                                                                            |
-| ------------- | ------------------------ | -------------------------------------------------------------------------------- |
-| `name`        | `string`                 | lowercase alphanumeric plus `-`/`_`; `__` is reserved as the tool-name separator |
-| `description` | `string`                 | shown in the agent's MCP catalog                                                 |
-| `enabled`     | `boolean`                | default `true`; `false` keeps the config but skips connecting                    |
-| `timeoutMs`   | `number`                 | per-request timeout, max 600000 (10 min); default 30000                          |
-| `command`     | `string`                 | stdio only                                                                       |
-| `args`        | `string[]`               | stdio only                                                                       |
-| `url`         | `string`                 | http/https only                                                                  |
-| `env`         | `Record<string, Secret>` | stdio only — see the env allowlist note below                                    |
-| `headers`     | `Record<string, Secret>` | **http only** — static request headers                                           |
-| `bearerToken` | `Secret`                 | **http only** — sugar for `Authorization: Bearer <token>`                        |
-| `allowTools`  | `string[]`               | bare tool names; when set, only these are exposed                                |
-| `denyTools`   | `string[]`               | bare tool names; blocked even if `allowTools` lists them                         |
+| Field         | Type                     | Notes                                                                              |
+| ------------- | ------------------------ | ---------------------------------------------------------------------------------- |
+| `name`        | `string`                 | lowercase alphanumeric plus `-`/`_`; `__` is reserved as the tool-name separator   |
+| `description` | `string`                 | shown in the agent's MCP catalog                                                   |
+| `enabled`     | `boolean`                | default `true`; `false` keeps the config but skips connecting                      |
+| `timeoutMs`   | `number`                 | per-request timeout, max 600000 (10 min); default 30000                            |
+| `command`     | `string`                 | stdio only                                                                         |
+| `args`        | `string[]`               | stdio only                                                                         |
+| `url`         | `string`                 | http/https only                                                                    |
+| `env`         | `Record<string, Secret>` | stdio only — see the env allowlist note below                                      |
+| `headers`     | `Record<string, Secret>` | **http only** — static request headers                                             |
+| `bearerToken` | `Secret`                 | **http only** — sugar for `Authorization: Bearer <token>`                          |
+| `oauth`       | `McpOAuth`               | **http only** — pre-registered OAuth client; mutually exclusive with Authorization |
+| `allowTools`  | `string[]`               | bare tool names; when set, only these are exposed                                  |
+| `denyTools`   | `string[]`               | bare tool names; blocked even if `allowTools` lists them                           |
 
 ### Authentication
 
@@ -190,8 +201,13 @@ HTTP servers authenticate one of two ways:
   process env. An unresolvable header fails the connection loudly instead of being dropped
   — headers _are_ the credential, and a dropped one only resurfaces as an opaque 401.
 - **OAuth** — run `typeclaw mcp auth <name>` on the **host**; tokens land in `secrets.json`.
-  A server carrying its own `Authorization` header needs no OAuth and gets no auth provider.
-  Other custom headers (tenant routing, tracing) coexist with OAuth fine.
+  By default TypeClaw uses Dynamic Client Registration (DCR). For authorization servers
+  that require a client registered ahead of time, set `oauth.clientId`; `clientSecret`,
+  `scope`, and `redirectUri` are optional. The default callback is
+  `http://localhost:1456/callback`; when configured, `oauth.redirectUri` must exactly
+  match that callback (including a `--port` override). `oauth.clientSecret` is a `Secret`.
+  A server carrying its own `Authorization` header cannot also use OAuth; other custom
+  headers (tenant routing, tracing) coexist with OAuth fine.
 
 `typeclaw mcp list` reports the per-server auth state; `typeclaw mcp logout <name>` clears it.
 
