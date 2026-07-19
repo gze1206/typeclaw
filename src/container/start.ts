@@ -656,6 +656,13 @@ export async function planStart({
     `${publishHost}:${hostPort}:${CONTAINER_PORT}`,
   ]
 
+  // Docker's default AppArmor profile can deny bwrap's recursive mount
+  // propagation setup (`Failed to make / slave`) even after seccomp is disabled.
+  // AppArmor is a Linux LSM, and Docker daemons without it reject this option,
+  // so emit it only for a Linux host. The outer container remains single-tenant;
+  // bwrap's per-tool namespace is the model-command boundary.
+  if (platform === 'linux') runArgs.push('--security-opt', 'apparmor=unconfined')
+
   // Network egress filter: when `typeclaw.json#network.blockInternal` is true,
   // grant the container CAP_NET_ADMIN at boot so the entrypoint shim can
   // install iptables OUTPUT rules. The shim drops the capability from the

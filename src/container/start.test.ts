@@ -264,6 +264,17 @@ describe('planStart', () => {
     expect(idx).toBeLessThan(plan.runArgs.indexOf(plan.imageTag))
   })
 
+  test('sets Linux AppArmor unconfined so bwrap can change mount propagation', async () => {
+    await writeDockerfile(root)
+    await writePackageJson(root, { typeclaw: '^0.1.0' })
+
+    const linux = await planStart({ cwd: root, hostPort: 8973, imageExists: true, platform: 'linux' })
+    const nonLinux = await planStart({ cwd: root, hostPort: 8973, imageExists: true, platform: 'darwin' })
+
+    expect(linux.runArgs).toContain('apparmor=unconfined')
+    expect(nonLinux.runArgs).not.toContain('apparmor=unconfined')
+  })
+
   test('can publish the TUI websocket port on all host interfaces', async () => {
     await writeDockerfile(root)
     await writePackageJson(root, { typeclaw: '^0.1.0' })

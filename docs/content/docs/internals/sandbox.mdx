@@ -120,7 +120,7 @@ These invariants are the always-on **kernel containment** boundary, applied to e
 
 ## `--security-opt seccomp=unconfined`
 
-`planStart()` in `src/container/start.ts` adds `--security-opt seccomp=unconfined` unconditionally. Without it, Docker's default seccomp profile blocks `unshare(CLONE_NEWUSER)` and `clone(CLONE_NEWUSER)` for non-privileged containers, and bwrap exits at startup with "setting up uid map: Permission denied."
+`planStart()` in `src/container/start.ts` adds `--security-opt seccomp=unconfined` unconditionally. Without it, Docker's default seccomp profile blocks `unshare(CLONE_NEWUSER)` and `clone(CLONE_NEWUSER)` for non-privileged containers, and bwrap exits at startup with "setting up uid map: Permission denied." On Linux hosts it also adds `--security-opt apparmor=unconfined`: Docker's default AppArmor profile can deny bwrap's recursive mount-propagation setup, which otherwise fails before the payload with `Failed to make / slave: Permission denied`. The option is omitted on non-Linux hosts because AppArmor is a Linux LSM and daemons without it reject an AppArmor security option.
 
 The default profile is calibrated for multi-tenant container hosts — Kubernetes nodes, CI runners — where seccomp is one of several boundaries protecting tenant isolation. TypeClaw is single-tenant. The user owns the host, the agent folder is bind-mounted in, the secrets are in the env. The blast radius of an attacker already executing code inside the container is dominated by what they can do with those existing reads, not by the syscalls seccomp blocks. Dropping the filter loses the wrong thing from the wrong threat model.
 
