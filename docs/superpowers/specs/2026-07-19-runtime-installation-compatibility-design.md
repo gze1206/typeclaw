@@ -17,13 +17,13 @@ The change does not broaden model access to credentials, permit user-controlled 
 
 ### Installed skill files
 
-File snapshots retain the single-hardlink requirement by default. A narrow exception permits a multi-linked regular file only when it is a `SKILL.md` whose resolved path is under an installed package's `node_modules/<package>/skills/` tree. The exception is structural, not name-only: the path must be below the agent's real `node_modules` root and the file remains subject to the existing inode, size, canonical-secret, and immutable-copy checks.
+File snapshots retain the single-hardlink requirement by default. A narrow exception permits a multi-linked regular file only when it is a `SKILL.md` whose resolved path is under an installed package's `node_modules/<package>/skills/` tree. The exception is structural, not name-only: the path must be below the agent's real `node_modules` root and the file remains subject to the existing inode, link-count, size, canonical-secret, and immutable-copy checks. The snapshot rechecks the authorized inode and link count after opening the file, so a link added while waiting for snapshot capacity still fails closed.
 
 This permits Bun's content-addressed installation layout for package-provided skills while preserving the hardlink rejection for every operator-controlled input, including arbitrary files under the agent root or workspace.
 
 ### Internal Git metadata scan
 
-The scanner's Git process receives a generated, empty configuration containing only `safe.directory=<real agent directory>`, alongside its existing hookless, no-system-config, no-replace-object and no-network restrictions. This is scanner-private configuration: it does not modify host or container Git configuration and does not grant model-driven Git access to arbitrary global configuration.
+The scanner's Git process receives an injected, otherwise-empty configuration containing only `safe.directory=<real agent directory>`, alongside its existing hookless, no-system-config, no-replace-object and no-network restrictions. This is scanner-private configuration: it does not modify host or container Git configuration and does not grant model-driven Git access to arbitrary global configuration.
 
 Git can therefore inspect the bind-mounted repository even when the runtime UID differs from the host owner. The scanner continues to fail closed for every real Git/object error and every canonical-secret history match.
 
