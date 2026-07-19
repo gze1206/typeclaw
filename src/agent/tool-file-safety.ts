@@ -24,6 +24,8 @@ type VerifiedInput = {
   dev: number
   ino: number
   size: number
+  nlink: number
+  allowHardlinks: boolean
   kind: 'file' | 'directory'
 }
 
@@ -103,11 +105,22 @@ export async function enforceAndPinToolFiles(options: {
           ? 'directory'
           : undefined
       if (kind === undefined) throw new Error(`tool input is not a supported regular file or directory: ${original}`)
-      if (kind === 'file') assertSingleLinkRegularFile(inspected, original)
+      const allowHardlinks = kind === 'file' && (await isInstalledPackageSkill(options.agentDir, resolved))
+      if (kind === 'file') assertSingleLinkRegularFile(inspected, original, allowHardlinks)
       if (kind === 'file' && inspected.size > maxBytes) throw inputTooLarge(original, inspected.size, maxBytes)
       declaredBytes += kind === 'file' ? inspected.size : 0
       if (declaredBytes > maxBytes) throw aggregateInputTooLarge(declaredBytes, maxBytes)
-      verified.push({ target, original, resolved, dev: inspected.dev, ino: inspected.ino, size: inspected.size, kind })
+      verified.push({
+        target,
+        original,
+        resolved,
+        dev: inspected.dev,
+        ino: inspected.ino,
+        size: inspected.size,
+        nlink: inspected.nlink,
+        allowHardlinks,
+        kind,
+      })
     }
 
     lease = await pinnedSnapshotBudget.acquire(declaredBytes, verified.length, options.signal)
@@ -121,8 +134,8 @@ export async function enforceAndPinToolFiles(options: {
         const source = await openInput(input.resolved, input.original)
         try {
           const opened = await source.stat()
-          assertSingleLinkRegularFile(opened, input.original)
-          if (opened.dev !== input.dev || opened.ino !== input.ino) {
+          assertSingleLinkRegularFile(opened, input.original, input.allowHardlinks)
+          if (opened.dev !== input.dev || opened.ino !== input.ino || opened.nlink !== input.nlink) {
             throw new Error(`tool input changed while waiting for snapshot capacity: ${input.original}`)
           }
           copiedBytes += await streamSnapshot(
@@ -789,9 +802,23 @@ async function snapshotOpenedDirectory(
   }
 }
 
-function assertSingleLinkRegularFile(stats: Stats, original: string): void {
+async function isInstalledPackageSkill(agentDir: string, resolved: string): Promise<boolean> {
+  const nodeModules = await realpath(path.join(agentDir, 'node_modules')).catch(() => undefined)
+  if (nodeModules === undefined) return false
+  const relative = path.relative(nodeModules, resolved)
+  if (relative === '' || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    return false
+  }
+  const segments = relative.split(path.sep)
+  const packageSegments = segments[0]?.startsWith('@') === true ? 2 : 1
+  if (segments.length < packageSegments + 3) return false
+  if (segments[0] === '' || segments[0] === '.' || segments[packageSegments - 1] === undefined) return false
+  return segments[packageSegments] === 'skills' && segments.at(-1) === 'SKILL.md'
+}
+
+function assertSingleLinkRegularFile(stats: Stats, original: string, allowHardlinks = false): void {
   if (!stats.isFile()) throw new Error(`tool input changed to a non-regular file before snapshot: ${original}`)
-  if (stats.nlink !== 1) {
+  if (stats.nlink !== 1 && !allowHardlinks) {
     throw new Error(
       `tool input has ${stats.nlink} hard links and cannot be snapshotted safely; copy it to a unique regular file before retrying: ${original}`,
     )

@@ -1778,6 +1778,83 @@ describe('wrapSystemTool', () => {
     }
   })
 
+  test('snapshots a Bun-style hardlinked package SKILL.md', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-package-skill-hardlink-'))
+    const cacheFile = path.join(agentDir, 'bun-cache-skill.md')
+    const skill = path.join(agentDir, 'node_modules', 'example-package', 'skills', 'example', 'SKILL.md')
+    await mkdir(path.dirname(skill), { recursive: true })
+    await writeFile(cacheFile, 'package skill')
+    await link(cacheFile, skill)
+    const args: Record<string, unknown> = { path: skill }
+    try {
+      expect((await stat(skill)).nlink).toBe(2)
+      const pinned = await enforceAndPinToolFiles({ tool: 'read', args, agentDir })
+      expect(await readFile(args.path as string, 'utf8')).toBe('package skill')
+      await pinned.cleanup()
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('keeps a hardlinked non-skill package file blocked', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-package-nonskill-hardlink-'))
+    const cacheFile = path.join(agentDir, 'bun-cache-readme.md')
+    const file = path.join(agentDir, 'node_modules', 'example-package', 'README.md')
+    await mkdir(path.dirname(file), { recursive: true })
+    await writeFile(cacheFile, 'not a skill')
+    await link(cacheFile, file)
+    try {
+      await expect(enforceAndPinToolFiles({ tool: 'read', args: { path: file }, agentDir })).rejects.toThrow(
+        /hard links.*unique regular file/i,
+      )
+    } finally {
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
+
+  test('rejects a package skill when its hardlink count changes while queued', async () => {
+    const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-package-skill-link-race-'))
+    const holderFiles = Array.from({ length: PINNED_SNAPSHOT_GLOBAL_MAX_COUNT }, (_, i) =>
+      path.join(agentDir, `holder-${i}.txt`),
+    )
+    const cacheFile = path.join(agentDir, 'bun-cache-skill.md')
+    const skill = path.join(agentDir, 'node_modules', 'example-package', 'skills', 'example', 'SKILL.md')
+    const lateAlias = path.join(agentDir, 'late-skill-alias.md')
+    await Promise.all(holderFiles.map(async (file) => await writeFile(file, 'x')))
+    await mkdir(path.dirname(skill), { recursive: true })
+    await writeFile(cacheFile, 'package skill')
+    await link(cacheFile, skill)
+    let holder: Awaited<ReturnType<typeof enforceAndPinToolFiles>> | undefined
+    try {
+      holder = await enforceAndPinToolFiles({
+        tool: 'channel_send',
+        args: { attachments: holderFiles.map((path) => ({ path })) },
+        agentDir,
+      })
+      let dispatched = false
+      const waiting = enforceAndPinToolFiles({ tool: 'read', args: { path: skill }, agentDir }).then(
+        async (pinned) => {
+          dispatched = true
+          await pinned.cleanup()
+          return undefined
+        },
+        (error: unknown) => error,
+      )
+      await Bun.sleep(10)
+      await link(skill, lateAlias)
+      await holder.cleanup()
+      holder = undefined
+
+      const failure = await waiting
+      expect(failure).toBeInstanceOf(Error)
+      expect((failure as Error).message).toMatch(/changed while waiting for snapshot capacity/i)
+      expect(dispatched).toBeFalse()
+    } finally {
+      await holder?.cleanup()
+      await rm(agentDir, { recursive: true, force: true })
+    }
+  })
+
   test('direct snapshots reject a file hardlinked to .env after initial authorization but before open', async () => {
     const agentDir = await mkdtemp(path.join(tmpdir(), 'typeclaw-direct-hardlink-race-'))
     const holderFiles = Array.from({ length: PINNED_SNAPSHOT_GLOBAL_MAX_COUNT }, (_, i) =>
