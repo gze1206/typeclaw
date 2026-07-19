@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { appendFile, chmod, mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { appendFile, chmod, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { delimiter, dirname, isAbsolute, join } from 'node:path'
 
@@ -8,6 +8,7 @@ import { isWindows } from '@/shared'
 import {
   GitSecretHistoryError,
   assertNoCanonicalSecretsInGit,
+  buildGitScanEnv,
   resetGitSecretHistoryCacheForTests,
   scanCanonicalSecretsInGit,
 } from './secret-history'
@@ -21,6 +22,22 @@ afterEach(async () => {
 })
 
 describe('canonical Git secret history guard', () => {
+  test('builds scanner-only configuration that accepts a dubious-owned agent directory', async () => {
+    const repo = await makeRepo()
+    await commitFile(repo, 'README.md', 'safe')
+    const env = await buildGitScanEnv(repo)
+    const proc = Bun.spawn(['git', '-C', repo, 'rev-parse', '--is-inside-work-tree'], {
+      stdout: 'pipe',
+      stderr: 'pipe',
+      env: { ...env, GIT_TEST_ASSUME_DIFFERENT_OWNER: '1' },
+    })
+    expect(await new Response(proc.stdout).text()).toBe('true\n')
+    expect(await proc.exited).toBe(0)
+    expect(env.GIT_CONFIG_COUNT).toBe('1')
+    expect(env.GIT_CONFIG_KEY_0).toBe('safe.directory')
+    expect(env.GIT_CONFIG_VALUE_0).toBe(await realpath(repo))
+  })
+
   test('leaves a clean repository unaffected', async () => {
     const repo = await makeRepo()
     await commitFile(repo, 'README.md', 'safe')

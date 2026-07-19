@@ -1,3 +1,4 @@
+import { realpath } from 'node:fs/promises'
 import { isAbsolute, join } from 'node:path'
 
 import { CANONICAL_AGENT_SECRET_DIRS, CANONICAL_AGENT_SECRET_FILES } from '@/sandbox/canonical-secrets'
@@ -324,21 +325,7 @@ async function spawnGit(
   const proc = Bun.spawn(['git', ...hooklessGitArgs(['-C', agentDir, ...gitArgs, ...args])], {
     stdout: 'pipe',
     stderr: 'pipe',
-    env: {
-      PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin',
-      HOME: process.env.HOME ?? '/tmp',
-      GIT_TERMINAL_PROMPT: '0',
-      GIT_PAGER: 'cat',
-      GIT_CONFIG_GLOBAL: '/dev/null',
-      GIT_CONFIG_SYSTEM: '/dev/null',
-      GIT_NO_REPLACE_OBJECTS: '1',
-      // Keep the scan strictly local. GIT_NO_LAZY_FETCH stops a promisor/partial-clone fetch on
-      // Git >=2.45 (and backported maints), but is silently ignored on older Git; the empty
-      // GIT_ALLOW_PROTOCOL whitelist (a since-2.20 control) denies every transport, so even the
-      // internal lazy `git fetch` those versions still attempt fails closed before touching a remote.
-      GIT_NO_LAZY_FETCH: '1',
-      GIT_ALLOW_PROTOCOL: '',
-    },
+    env: await buildGitScanEnv(agentDir),
   })
   const [stdout, stderr, exitCode] = await Promise.all([
     new Response(proc.stdout).text(),
@@ -346,6 +333,27 @@ async function spawnGit(
     proc.exited,
   ])
   return { stdout, stderr, exitCode }
+}
+
+export async function buildGitScanEnv(agentDir: string): Promise<Record<string, string>> {
+  return {
+    PATH: process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin',
+    HOME: process.env.HOME ?? '/tmp',
+    GIT_TERMINAL_PROMPT: '0',
+    GIT_PAGER: 'cat',
+    GIT_CONFIG_GLOBAL: '/dev/null',
+    GIT_CONFIG_SYSTEM: '/dev/null',
+    GIT_CONFIG_COUNT: '1',
+    GIT_CONFIG_KEY_0: 'safe.directory',
+    GIT_CONFIG_VALUE_0: await realpath(agentDir),
+    GIT_NO_REPLACE_OBJECTS: '1',
+    // Keep the scan strictly local. GIT_NO_LAZY_FETCH stops a promisor/partial-clone fetch on
+    // Git >=2.45 (and backported maints), but is silently ignored on older Git; the empty
+    // GIT_ALLOW_PROTOCOL whitelist (a since-2.20 control) denies every transport, so even the
+    // internal lazy `git fetch` those versions still attempt fails closed before touching a remote.
+    GIT_NO_LAZY_FETCH: '1',
+    GIT_ALLOW_PROTOCOL: '',
+  }
 }
 
 async function runGit(agentDir: string, gitArgs: readonly string[], args: readonly string[]): Promise<string> {
